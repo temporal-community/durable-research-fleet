@@ -12,45 +12,29 @@ then merged into one cited report. The pool scales `0 → N → 0` on its own.
 
 ## What you're looking at
 
-Outline rail on the left, the cited report in the middle, sources on the right, and
-the fleet counters along the bottom. When a draft is ready the Workflow parks and
-waits for you — `WAITING FOR YOU`, with the review card in the left rail.
-
-![The research console](docs/images/hero-console.png)
-
-### Mid-fan-out
-
-Two parts done, four still running, six workers up and a peak of 22 this session.
-The right rail shows the fleet as it happens; the sparkline is the shape of the burst.
-
-![Six workers researching in parallel](docs/images/console-fanout.png)
-
-The footer is the same numbers, sized for a projector at the back of a room:
+Outline on the left, the cited report in the middle, sources on the right, live fleet
+counters along the bottom. When the draft is ready the Workflow parks and waits for
+you — that's `WAITING FOR YOU`, with the review card in the left rail.
 
 ![Live fleet counters](docs/images/footer-workers.png)
 
-### The two beats
+Two beats make the demo:
 
-- **Fan-out** — six sub-question Activities are scheduled at once. With one Activity
-  slot per instance, most of them can't be picked up by the current pool, so
-  Temporal's Worker Controller scales out to meet them.
-- **Wake from zero** — after the draft, the Workflow waits for a human. It holds no
-  task at all, so the pool drops to **zero with a live Workflow still in flight**.
-  Your approval wakes it.
+- **Fan-out** — six sub-question Activities are scheduled at once. One Activity slot
+  per instance means most can't be picked up by the current pool, so the Worker
+  Controller scales out to meet them.
+- **Wake from zero** — after the draft the Workflow holds no task at all, so the pool
+  drops to **zero with a live Workflow still in flight**. Your approval wakes it.
 
-Temporal's own timeline shows both: six `research_subquestion` Activities overlapping,
-then `synthesize`, then a 2-hour timer while it waits for a human — ended early by the
-`review` Signal.
+Temporal's timeline shows both: six `research_subquestion` Activities overlapping,
+then `synthesize`, then a 2-hour timer ended early by the `review` Signal.
 
-![Temporal timeline showing six concurrent activities and the review pause](docs/images/temporal-timeline.png)
+![Temporal timeline: six concurrent activities, then the review pause](docs/images/temporal-timeline.png)
 
-Same run while still in flight, timer pending:
+And Cloud Run's own metrics, from the other side — instance count climbing and
+returning to zero, over and over:
 
-![Temporal timeline mid-run](docs/images/temporal-running.png)
-
-And the finished report once you accept it:
-
-![The completed report](docs/images/console-done.png)
+![Cloud Run worker pool scaling from zero](docs/images/cloud-run-pool.png)
 
 ---
 
@@ -116,14 +100,10 @@ prompt — without it `make up` cannot complete unattended.
 > and Terraform ships it to the VM. Temporal Cloud additionally needs Pre-release
 > access on your Namespace; self-hosted does not. See `docs/TUTORIAL.md`.
 
-**After a rebuild, force the pool onto the new digest.** Pushing the same image tag
-does *not* redeploy it — Cloud Run pins the digest when a revision is created, so new
-worker code silently never arrives:
-
-```bash
-DIGEST=$(gcloud artifacts docker images describe "$IMAGE" --format='value(image_summary.digest)')
-gcloud run worker-pools update research-fleet-worker-pool --image "$REPO@$DIGEST" --region "$REGION"
-```
+One trap worth knowing: **after a rebuild, force the pool onto the new digest.**
+Pushing the same image tag does not redeploy it — Cloud Run pins the digest when a
+revision is created, so new worker code silently never arrives. `CLAUDE.md` gate #14
+has the command.
 
 ---
 
@@ -153,7 +133,6 @@ Locally you can skip all of it — the defaults target `temporal server start-de
 |---|---|---|
 | `TEMPORAL_ADDRESS` | `localhost:7233` | `<ns>.<acct>.tmprl.cloud:7233` for Cloud |
 | `TEMPORAL_API_KEY` | *unset* | Temporal Cloud; setting it turns TLS on |
-| `TEMPORAL_TASK_QUEUE` | `research-queue` | |
 | `TEMPORAL_DEPLOYMENT_NAME` | `research-fleet` | A mismatch makes Workflows hang with **no error** |
 | `MAX_CONCURRENT_ACTIVITIES` | `1` | Activity slots per Worker. Raising it hides the scaling behaviour |
 | `MAX_SUBQUESTIONS` | `6` | Fan-out width — this *is* the worker count one question lights up |
@@ -170,14 +149,12 @@ Full list with reasoning lives in `runtime.py` and `research_activities.py`.
 | | |
 |---|---|
 | `runtime.py` | The infra half — connect, versioned Worker, slot limits, SIGTERM drain. App-agnostic |
-| `workflows.py` / `activities.py` | The hello app: the infrastructure smoke test |
+| `workflows.py` · `activities.py` | The hello app: the infrastructure smoke test |
 | `llm.py` | The Claude seam. Imports no `temporalio`; `max_retries=0` because Temporal owns retry |
 | `research_*.py` | Plan → fan out → draft → human review → optional second pass |
-| `web.py` + `web/` | The single-page console. Vanilla JS, no build step |
+| `web.py` · `web/` | The single-page console. Vanilla JS, no build step |
 | `terraform/` | The whole GCP stack, one `make up` |
-| `tests/` | 111 offline tests |
-| `learn/README.md` | Eleven cards on Temporal → Serverless Workers, rendered in-app |
-| `docs/` | `TUTORIAL.md` (runnable gcloud walkthrough), `KNOWLEDGE_BASE.md` (research base) |
+| `tests/` · `learn/` · `docs/` | 111 offline tests · eleven in-app learn cards · tutorial and knowledge base |
 
 ---
 
