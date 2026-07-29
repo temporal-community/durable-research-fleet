@@ -14,17 +14,22 @@ then merged into one cited report. The pool scales `0 → N → 0` on its own.
 
 Outline rail on the left, the cited report in the middle, sources on the right, and
 the fleet counters along the bottom. When a draft is ready the Workflow parks and
-waits for you — `WAITING FOR YOU`, bottom left.
+waits for you — `WAITING FOR YOU`, with the review card in the left rail.
 
 ![The research console](docs/images/hero-console.png)
 
-The footer is live. `WORKERS` is how many Cloud Run instances are polling right now;
-`SPAWNED` is how many have existed this session; the sparkline is the shape of the
-burst:
+### Mid-fan-out
+
+Two parts done, four still running, six workers up and a peak of 22 this session.
+The right rail shows the fleet as it happens; the sparkline is the shape of the burst.
+
+![Six workers researching in parallel](docs/images/console-fanout.png)
+
+The footer is the same numbers, sized for a projector at the back of a room:
 
 ![Live fleet counters](docs/images/footer-workers.png)
 
-Two beats worth watching:
+### The two beats
 
 - **Fan-out** — six sub-question Activities are scheduled at once. With one Activity
   slot per instance, most of them can't be picked up by the current pool, so
@@ -33,11 +38,19 @@ Two beats worth watching:
   task at all, so the pool drops to **zero with a live Workflow still in flight**.
   Your approval wakes it.
 
-Both are visible in Temporal's own timeline — six `research_subquestion` Activities
-overlapping, then `synthesize`, then a 2-hour timer while it waits for a human, ended
-early by the `review` Signal:
+Temporal's own timeline shows both: six `research_subquestion` Activities overlapping,
+then `synthesize`, then a 2-hour timer while it waits for a human — ended early by the
+`review` Signal.
 
 ![Temporal timeline showing six concurrent activities and the review pause](docs/images/temporal-timeline.png)
+
+Same run while still in flight, timer pending:
+
+![Temporal timeline mid-run](docs/images/temporal-running.png)
+
+And the finished report once you accept it:
+
+![The completed report](docs/images/console-done.png)
 
 ---
 
