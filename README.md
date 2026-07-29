@@ -12,12 +12,17 @@ then merged into one cited report. The pool scales `0 → N → 0` on its own.
 
 ## What you're looking at
 
-| | |
-|---|---|
-| ![Asking a question](docs/images/console-ask.png) | ![The report](docs/images/console-report.png) |
-| Ask from a phone — the footer honestly reads `0 WORKERS` | Sectioned report, outline rail left, cited sources right |
+Outline rail on the left, the cited report in the middle, sources on the right, and
+the fleet counters along the bottom. When a draft is ready the Workflow parks and
+waits for you — `WAITING FOR YOU`, bottom left.
 
-![Workers spawning mid-fan-out](docs/images/footer-workers.png)
+![The research console](docs/images/hero-console.png)
+
+The footer is live. `WORKERS` is how many Cloud Run instances are polling right now;
+`SPAWNED` is how many have existed this session; the sparkline is the shape of the
+burst:
+
+![Live fleet counters](docs/images/footer-workers.png)
 
 Two beats worth watching:
 
@@ -28,7 +33,11 @@ Two beats worth watching:
   task at all, so the pool drops to **zero with a live Workflow still in flight**.
   Your approval wakes it.
 
-![Temporal event history showing six concurrent activities](docs/images/temporal-history.png)
+Both are visible in Temporal's own timeline — six `research_subquestion` Activities
+overlapping, then `synthesize`, then a 2-hour timer while it waits for a human, ended
+early by the `review` Signal:
+
+![Temporal timeline showing six concurrent activities and the review pause](docs/images/temporal-timeline.png)
 
 ---
 
