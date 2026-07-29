@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#141414">
+<title>Deep research on Temporal Serverless Workers</title>
+<link rel="preload" href="/fonts/archivo-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body data-state="idle" data-tab="report">
+
+<header class="top">
+  <img src="/temporal-logo.svg" alt="Temporal" width="76" height="55">
+  <span class="what">serverless workers</span>
+  <span class="spacer"></span>
+  <button class="plain" id="learnBtn">Learn</button>
+  <span class="pulse" id="pulse" aria-hidden="true"></span>
+</header>
+
+<main>
+  <!-- ONE DOM. Nothing is removed, only hidden by [data-state], which is what lets
+       the ask → report change animate instead of jump. -->
+
+  <section class="ask only-idle">
+    <h1>Ask something worth researching.</h1>
+    <p class="lede">
+      Your question is split into parts and researched in parallel on Cloud Run
+      workers that did not exist a second ago. Watch the counter at the bottom.
+    </p>
+
+    <div class="field">
+      <textarea id="q" rows="3" maxlength="500" enterkeyhint="go"
+        aria-label="Your research question"
+        placeholder="Why does durable execution matter for AI agents?"></textarea>
+      <span class="count num" id="count">0/500</span>
+    </div>
+
+    <div class="field" id="passField" style="display:none; margin-top:.6rem">
+      <!-- autocapitalize/autocorrect off so the phone keyboard stops fighting a
+           lowercase passcode. The server compares case-insensitively anyway, but
+           there is no reason to show the attendee a capital they did not type. -->
+      <input id="passcode" class="txt" type="text" autocomplete="off"
+        autocapitalize="none" autocorrect="off" spellcheck="false"
+        aria-label="Passcode" placeholder="Passcode from the stage">
+    </div>
+
+    <div class="row" style="margin-top:.85rem">
+      <button id="go">Research it</button>
+      <span class="hint">⌘↵ to send</span>
+    </div>
+    <p class="err" id="askErr" role="alert"></p>
+  </section>
+
+  <!-- LEFT RAIL: where you are, and how far along -->
+  <aside class="rail rail-left only-run" aria-label="Outline, progress and review">
+    <div class="panel zone-outline">
+      <div class="rail-head"><span class="label">outline</span></div>
+      <ul class="outline" id="outline"></ul>
+      <p class="hint" id="outlineEmpty">Appears as the report is written.</p>
+    </div>
+    <div class="panel zone-parts">
+      <div class="rail-head">
+        <span class="label">parts</span>
+        <span class="n num" id="partsCount">0/0</span>
+      </div>
+      <div class="ticks" id="ticks"></div>
+      <details id="partsDetails">
+        <summary class="label" style="cursor:pointer">the sub-questions</summary>
+        <ul class="parts" id="parts"></ul>
+      </details>
+    </div>
+
+    <!-- The review gate. It lives in the rail rather than the reading column so it
+         is visible without scrolling to the end of a 1400-word report.
+         Deliberately NOT tagged as a zone-*: the narrow-screen tab rules hide the
+         zones, not this, because an attendee on the Report tab must still be able
+         to accept or refine. -->
+    <div class="panel action" id="reviewCard" hidden>
+      <div class="rail-head"><span class="label">your call</span></div>
+      <p class="hint" style="margin-top:0">
+        Nothing is running while this waits — the workers have gone back to zero.
+        This link keeps working; come back to it whenever.
+      </p>
+      <div class="field" style="margin:.6rem 0">
+        <input id="note" class="txt" type="text" maxlength="500"
+          aria-label="Anything to dig deeper into?"
+          placeholder="Dig deeper into…?">
+      </div>
+      <div class="row">
+        <button id="accept">Good enough</button>
+        <button id="refine" class="ghost">Dig deeper</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- CENTRE: the report and nothing else -->
+  <section class="report only-run">
+    <div class="report-inner">
+      <h1 class="qtitle" id="qtitle"></h1>
+
+      <div class="stage-line">
+        <span class="pulse" id="stageDot" aria-hidden="true"></span>
+        <span class="label" id="stage">starting</span>
+        <span class="label num" id="elapsed"></span>
+      </div>
+
+      <p class="err" id="runErr" role="alert"></p>
+      <div class="prose" id="prose"></div>
+
+      <p class="hint" id="permalink" style="margin-top:1.4rem"></p>
+    </div>
+  </section>
+
+  <!-- RIGHT RAIL: the evidence, and the fleet doing the work -->
+  <aside class="rail rail-right only-run" aria-label="Sources and workers">
+    <div class="panel">
+      <div class="rail-head">
+        <span class="label">sources</span>
+        <span class="n num" id="srcCount">0</span>
+      </div>
+      <ul class="sources" id="sources"></ul>
+      <p class="hint" id="srcEmpty">Collected as each part finishes.</p>
+    </div>
+    <div class="panel">
+      <div class="rail-head">
+        <span class="label">workers</span>
+        <span class="n num" id="railWorkers">0</span>
+      </div>
+      <div class="grid-cells" id="cells" aria-hidden="true"></div>
+      <svg class="spark" id="railSpark" viewBox="0 0 100 34" preserveAspectRatio="none"
+           role="img" aria-label="Worker count over time"></svg>
+      <p class="hint" id="railPeak"></p>
+    </div>
+  </aside>
+</main>
+
+<!-- Narrow screens only: one zone at a time, so nothing stacks. -->
+<div class="tabbar only-run" role="tablist" aria-label="Sections">
+  <button role="tab" id="tab-report" aria-selected="true" aria-controls="panel-report">Report</button>
+  <button role="tab" id="tab-parts" aria-selected="false" aria-controls="panel-parts">Parts <span id="tabParts"></span></button>
+  <button role="tab" id="tab-sources" aria-selected="false" aria-controls="panel-sources">Sources <span id="tabSrc"></span></button>
+</div>
+
+<!-- The instrument strip. Always live, even at rest — a footer honestly reading
+     0 WORKERS before you ask is what makes the climb mean something. -->
+<footer class="readout">
+  <div class="readout-in">
+    <div class="tiles">
+      <div class="tile hero">
+        <span class="v num zero" id="tWorkers">0</span>
+        <span class="k">workers</span>
+      </div>
+      <div class="tile">
+        <span class="v num" id="tSpawned">0</span>
+        <span class="k">spawned</span>
+      </div>
+      <div class="tile">
+        <span class="v num" id="tSearches">0</span>
+        <span class="k">searches</span>
+      </div>
+      <div class="tile">
+        <span class="v num" id="tSources">0</span>
+        <span class="k">sources</span>
+      </div>
+      <div class="tile">
+        <span class="v num" id="tParts">0/0</span>
+        <span class="k">parts</span>
+      </div>
+    </div>
+    <div class="foot-spark">
+      <svg class="spark" id="footSpark" viewBox="0 0 100 30" preserveAspectRatio="none"
+           role="img" aria-label="Worker count over time"></svg>
+    </div>
+  </div>
+  <div class="durability" id="durability">
+    <span><b id="dInt">0</b> interruptions survived</span>
+    <span><b id="dSaved">0</b> sub-questions not redone</span>
+    <span><b id="dSearch">0</b> searches not repeated</span>
+  </div>
+</footer>
+
+<dialog class="learn" id="learnDlg" aria-labelledby="learnTitle">
+  <div class="dlg-head">
+    <span class="label" id="learnTitle">learn · serverless workers</span>
+    <span style="flex:1"></span>
+    <button class="plain" id="learnClose" aria-label="Close">Esc ✕</button>
+  </div>
+  <div class="dlg-body" id="learnBody">
+    <p class="hint">Loading…</p>
+  </div>
+</dialog>
+
+<script>
+// Vanilla JS on purpose: no framework, no bundler, no build step.
+//
+// ZERO innerHTML IN THIS FILE. The report is model output, so every text run is set
+// with textContent and every element is built with createElement. Clearing uses
+// replaceChildren(). tests/test_serverless_contract.py enforces this by grep — if
+// you reach for innerHTML, that test fails, and it is right to.
+
+const $ = (id) => document.getElementById(id);
+const RUN_MS = 1000;   // the run this page is watching
+const FLEET_MS = 2000; // the shared fleet number — /api/fleet is cached server-side
+const SPARK_POINTS = 120;
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+let runId = (location.pathname.match(/^\/r\/(.+)$/) || [])[1] || null;
+let runTimer = null, fleetTimer = null, tickTimer = null;
+let startedAt = null;   // only known for runs started in THIS tab
+let finished = false;
+let lastProse = '';     // avoid re-rendering identical markdown every second
+let spark = [];         // ring buffer of worker counts
+let peakSeen = 0;
+let maxCells = 8;
+let learnLoaded = false;
+let spy = null;
+
+/* ---------------------------------------------------------------- helpers */
+
+function setNum(el, value) {
+  const next = String(value);
+  if (el.textContent === next) return;
+  el.textContent = next;
+  if (REDUCED) return;
+  el.classList.remove('bump');
+  void el.offsetWidth;
+  el.classList.add('bump');
+}
+
+// Model-supplied URLs must never become javascript: or data: hrefs.
+function safeUrl(raw) {
+  try {
+    const u = new URL(raw, location.origin);
+    return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : null;
+  } catch { return null; }
+}
+
+function mmss(ms) {
+  const t = Math.max(0, Math.floor(ms / 1000));
+  return String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0');
+}
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+
+/* ------------------------------------------------- markdown, safely */
+
+// Strip any HTML tags from a run of trusted-ish text. Used for the Learn cards,
+// whose source is our own file but which contains real markup we do not render.
+const stripTags = (s) => s.replace(/<\/?[a-zA-Z][^>]*>/g, '');
+
+// Inline pass: **bold**, `code`, [text](url), and [n] citations. Everything that is
+// not one of those becomes a text node verbatim.
+function inline(parent, text, nSources) {
+  const re = /(\*\*[^*\n]+\*\*)|(`[^`\n]+`)|(\[[^\]\n]+\]\([^)\s]+\))|(\[(\d{1,3})\])/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) parent.append(document.createTextNode(text.slice(last, m.index)));
+    if (m[1]) {
+      parent.append(el('strong', null, m[1].slice(2, -2)));
+    } else if (m[2]) {
+      parent.append(el('code', null, m[2].slice(1, -1)));
+    } else if (m[3]) {
+      const cut = m[3].lastIndexOf('](');
+      const label = m[3].slice(1, cut);
+      const href = safeUrl(m[3].slice(cut + 2, -1));
+      if (href) {
+        const a = el('a', null, label);
+        a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+        parent.append(a);
+      } else {
+        parent.append(document.createTextNode(label));
+      }
+    } else if (m[4]) {
+      // A citation is only a link if it points at a source we actually have.
+      // Models miscount; an out-of-range number stays plain text rather than
+      // becoming a footnote to nothing.
+      const n = parseInt(m[5], 10);
+      if (nSources && n >= 1 && n <= nSources) {
+        const a = el('a', 'cite', '[' + n + ']');
+        a.href = '#src-' + n;
+        a.dataset.n = String(n);
+        parent.append(a);
+      } else {
+        parent.append(document.createTextNode(m[4]));
+      }
+    }
+    last = re.lastIndex;
+  }
+  if (last < text.length) parent.append(document.createTextNode(text.slice(last)));
+}
+
+// Block pass. Returns the container; headings get ids so the outline can link.
+function renderMarkdown(container, src, opts) {
+  const o = opts || {};
+  const nSources = o.nSources || 0;
+  const lines = String(src).replace(/\r/g, '').split('\n');
+  const frag = document.createDocumentFragment();
+  let para = [], list = null, quote = null, secN = 0, seenHeading = false;
+
+  const flushPara = () => {
+    if (!para.length) return;
+    const text = para.join(' ').trim();
+    para = [];
+    if (!text) return;
+    // The opening paragraph, before any heading, is the direct answer.
+    const p = el('p', (!seenHeading && !frag.childNodes.length) ? 'lede-answer' : null);
+    inline(p, o.strip ? stripTags(text) : text, nSources);
+    frag.append(p);
+  };
+  const flushList = () => { if (list) { frag.append(list); list = null; } };
+  const flushQuote = () => { if (quote) { frag.append(quote); quote = null; } };
+  const flushAll = () => { flushPara(); flushList(); flushQuote(); };
+
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+
+    // fenced code — verbatim, never inline-parsed
+    if (/^\s*```/.test(line)) {
+      flushAll();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) body.push(lines[i++]);
+      const pre = el('pre');
+      pre.append(el('code', null, body.join('\n')));
+      frag.append(pre);
+      continue;
+    }
+
+    const h = line.match(/^(#{1,3})\s+(.*)$/);
+    if (h) {
+      flushAll();
+      const level = h[1].length;
+      const tag = level === 1 ? 'h2' : (level === 2 ? 'h2' : 'h3');
+      const node = el(tag);
+      inline(node, o.strip ? stripTags(h[2]) : h[2], nSources);
+      if (tag === 'h2') { node.id = (o.idPrefix || 'sec') + '-' + (secN++); seenHeading = true; }
+      frag.append(node);
+      continue;
+    }
+
+    const li = line.match(/^\s*[-*]\s+(.*)$/);
+    if (li) {
+      flushPara(); flushQuote();
+      if (!list) list = el('ul');
+      const item = el('li');
+      inline(item, o.strip ? stripTags(li[1]) : li[1], nSources);
+      list.append(item);
+      continue;
+    }
+
+    const bq = line.match(/^\s*>\s?(.*)$/);
+    if (bq) {
+      flushPara(); flushList();
+      if (!quote) quote = el('blockquote');
+      const p = el('p');
+      // GitHub callout syntax ("[!NOTE]") is noise outside GitHub.
+      inline(p, stripTags(bq[1]).replace(/^\[!\w+\]\s*/, ''), nSources);
+      quote.append(p);
+      continue;
+    }
+
+    if (/^\s*$/.test(line)) { flushAll(); continue; }
+    if (/^\s*(---|\*\*\*)\s*$/.test(line)) { flushAll(); frag.append(el('hr')); continue; }
+
+    flushList(); flushQuote();
+    para.push(line.trim());
+  }
+  flushAll();
+
+  container.replaceChildren(frag);
+  return container;
+}
+
+/* --------------------------------------------------------- outline + spy */
+
+function buildOutline() {
+  const heads = [...$('prose').querySelectorAll('h2')];
+  const ul = $('outline');
+  $('outlineEmpty').hidden = heads.length > 0;
+  if (!heads.length) { ul.replaceChildren(); return; }
+
+  const frag = document.createDocumentFragment();
+  for (const h of heads) {
+    const li = el('li');
+    const a = el('a', null, h.textContent);
+    a.href = '#' + h.id;
+    li.append(a);
+    frag.append(li);
+  }
+  ul.replaceChildren(frag);
+
+  // Scroll-spy: highlight the section you are actually in, so the outline is a
+  // position indicator and not just a menu.
+  if (spy) spy.disconnect();
+  spy = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      const id = e.target.id;
+      for (const a of ul.querySelectorAll('a')) {
+        a.setAttribute('aria-current', a.getAttribute('href') === '#' + id ? 'true' : 'false');
+      }
+    }
+  }, { rootMargin: '-25% 0px -70% 0px' });
+  heads.forEach((h) => spy.observe(h));
+}
+
+// Citations live in the centre column but their targets live in a rail with its own
+// scrollbar, so scrollIntoView on the <li> is what actually works here.
+$('prose').addEventListener('click', (e) => {
+  const a = e.target.closest('a.cite');
+  if (!a) return;
+  e.preventDefault();
+  const li = $('src-' + a.dataset.n);
+  if (!li) return;
+  if (matchMedia('(max-width: 899px)').matches) setTab('sources');
+  li.scrollIntoView({ block: 'nearest', behavior: REDUCED ? 'auto' : 'smooth' });
+  li.classList.remove('flash');
+  void li.offsetWidth;
+  li.classList.add('flash');
+  setTimeout(() => li.classList.remove('flash'), 1600);
+});
+
+/* ------------------------------------------------------------ sparkline */
+
+function drawSpark(svg, w, h) {
+  const NS = 'http://www.w3.org/2000/svg';
+  svg.replaceChildren();
+  // Two points draw a degenerate stub that reads as a stray mark rather than a
+  // chart; wait until there is an actual shape to show.
+  if (spark.length < 3) return;
+  const max = Math.max(peakSeen, 1);
+  const step = w / (SPARK_POINTS - 1);
+  const pts = spark.map((v, i) => [i * step, h - (v / max) * (h - 2) - 1]);
+
+  const area = document.createElementNS(NS, 'polygon');
+  area.setAttribute('class', 'area');
+  area.setAttribute('points',
+    `0,${h} ` + pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ') +
+    ` ${pts[pts.length - 1][0].toFixed(1)},${h}`);
+  svg.append(area);
+
+  const line = document.createElementNS(NS, 'polyline');
+  line.setAttribute('class', 'line');
+  line.setAttribute('points', pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' '));
+  svg.append(line);
+}
+
+function drawCells(n) {
+  maxCells = Math.max(maxCells, peakSeen, n);
+  const box = $('cells');
+  if (box.children.length !== maxCells) {
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < maxCells; i++) frag.append(el('span', 'cell'));
+    box.replaceChildren(frag);
+  }
+  [...box.children].forEach((c, i) => { c.className = 'cell' + (i < n ? ' on' : ''); });
+}
+
+/* ------------------------------------------------------------------- ask */
+
+async function ask() {
+  const question = $('q').value.trim();
+  $('askErr').textContent = '';
+  if (!question) { $('askErr').textContent = 'Type a question first.'; return; }
+
+  $('go').disabled = true;
+  $('go').textContent = 'Starting…';
+  try {
+    const res = await fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ question, passcode: $('passcode').value || '' }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || 'Could not start.');
+    runId = body.id;
+    startedAt = Date.now();
+    history.replaceState({}, '', '/r/' + runId);
+    $('qtitle').textContent = question;
+    $('qtitle').classList.toggle('long', question.length > 120);
+    morph(() => { document.body.dataset.state = 'running'; });
+    beginRun();
+  } catch (err) {
+    $('askErr').textContent = err.message;
+    if (/passcode/i.test(err.message)) $('passField').style.display = 'block';
+    $('go').disabled = false;
+    $('go').textContent = 'Research it';
+  }
+}
+
+function morph(apply) {
+  if (document.startViewTransition && !REDUCED) {
+    document.startViewTransition(apply);
+  } else {
+    apply();
+    if (!REDUCED) {
+      $('qtitle').classList.remove('fade-in');
+      void $('qtitle').offsetWidth;
+      $('qtitle').classList.add('fade-in');
+    }
+  }
+}
+
+/* ------------------------------------------------------------------- run */
+
+const STAGES = {
+  planning:        'breaking your question into parts',
+  researching:     'researching in parallel',
+  drafting:        'writing the report',
+  awaiting_review: 'waiting for you',
+  refining:        'digging deeper',
+  done:            'done',
+};
+
+function beginRun() {
+  $('permalink').textContent = 'Your link: ' + location.href;
+  pollRun();
+  schedule();
+  if (startedAt && !tickTimer) {
+    tickTimer = setInterval(() => {
+      if (startedAt && !finished) $('elapsed').textContent = mmss(Date.now() - startedAt);
+    }, 1000);
+  }
+}
+
+// A run that ends without reaching "done" must SAY so. Previously a failed or
+// terminated Workflow, or a permalink whose history had aged out, left the page
+// polling a spinner forever with no message — the stage line just sat on
+// "researching in parallel" while nothing was running.
+function stopPolling() {
+  finished = true;
+  clearInterval(runTimer); runTimer = null;
+  clearInterval(tickTimer); tickTimer = null;
+  $('stageDot').className = 'pulse';
+}
+
+function runFailed(message) {
+  stopPolling();
+  $('stage').textContent = 'stopped';
+  $('runErr').textContent = message;
+}
+
+async function pollRun() {
+  if (!runId) return;
+  let s;
+  try {
+    const res = await fetch('/api/run/' + runId);
+    // 404 means NO SUCH RUN. Anything else — notably 503 "waiting for a worker" —
+    // is transient and must keep polling: a Query needs a Worker with a free
+    // workflow-task slot, and this platform spends real time with none available,
+    // both before the pool scales up and while every instance is deep in a research
+    // Activity. Treating those as terminal declared healthy runs dead ~30s in.
+    if (res.status === 404) {
+      runFailed('No run with this link — it may be from an older deployment. '
+        + 'Ask your question again.');
+      return;
+    }
+    if (res.status === 503) {
+      // Name it rather than hiding it: no worker exists yet IS the demo.
+      $('stage').textContent = 'waiting for a worker';
+      $('stageDot').className = 'pulse hot';
+      return;
+    }
+    if (!res.ok) return;
+    s = await res.json();
+  } catch { return; }      // network blip: the next tick retries
+  $('runErr').textContent = '';
+
+  if (s.question && !$('qtitle').textContent) {
+    $('qtitle').textContent = s.question;
+    $('qtitle').classList.toggle('long', s.question.length > 120);
+  }
+  $('stage').textContent = STAGES[s.stage] || s.stage;
+  $('stageDot').className = 'pulse' +
+    (s.stage === 'done' || s.stage === 'awaiting_review' ? '' : ' hot');
+
+  // --- parts, as a tick strip plus a collapsed list
+  const subs = s.sub_questions || [];
+  const done = new Set((s.findings || []).map((f) => f.question));
+  $('partsCount').textContent = (s.done || 0) + '/' + (s.total || 0);
+  $('tabParts').textContent = subs.length ? String(subs.length) : '';
+
+  const ticks = $('ticks');
+  if (ticks.children.length !== subs.length) {
+    const frag = document.createDocumentFragment();
+    subs.forEach((_, i) => frag.append(el('span', 'tick', String(i + 1))));
+    ticks.replaceChildren(frag);
+  }
+  const partsUl = $('parts');
+  if (partsUl.children.length !== subs.length) {
+    const frag = document.createDocumentFragment();
+    subs.forEach(() => {
+      const li = el('li');
+      li.append(el('span', 'mark'), el('span', 'txt'));
+      frag.append(li);
+    });
+    partsUl.replaceChildren(frag);
+  }
+  subs.forEach((text, i) => {
+    const ok = done.has(text);
+    const active = !ok && s.stage === 'researching';
+    const cls = ok ? 'done' : (active ? 'active' : '');
+    if (ticks.children[i]) {
+      ticks.children[i].className = 'tick ' + cls;
+      ticks.children[i].textContent = ok ? '✓' : String(i + 1);
+    }
+    const li = partsUl.children[i];
+    if (li) {
+      li.className = cls;
+      li.firstElementChild.textContent = ok ? '✓' : (active ? '▸' : '·');
+      li.lastElementChild.textContent = text;
+    }
+  });
+
+  // --- sources first: the report's citations are validated against this count
+  const srcs = s.sources || [];
+  $('srcCount').textContent = String(srcs.length);
+  $('tabSrc').textContent = srcs.length ? String(srcs.length) : '';
+  $('srcEmpty').hidden = srcs.length > 0;
+  const sul = $('sources');
+  if (sul.children.length !== srcs.length) {
+    const frag = document.createDocumentFragment();
+    srcs.forEach((src, i) => {
+      const li = el('li');
+      li.id = 'src-' + (i + 1);
+      li.append(el('span', 'n', String(i + 1)));
+      const href = safeUrl(src.url);
+      const holder = href ? el('a') : el('span');
+      if (href) { holder.href = href; holder.target = '_blank'; holder.rel = 'noopener noreferrer'; }
+      holder.textContent = src.title || src.url || 'source';
+      li.append(holder);
+      frag.append(li);
+    });
+    sul.replaceChildren(frag);
+  }
+
+  // --- the report
+  const text = s.answer || s.draft || '';
+  if (text && text !== lastProse) {
+    lastProse = text;
+    renderMarkdown($('prose'), text, { nSources: srcs.length, idPrefix: 'sec' });
+    $('prose').classList.toggle('draft', !s.answer);
+    buildOutline();
+  }
+
+  $('reviewCard').hidden = !s.awaiting_review;
+
+  // --- footer
+  setNum($('tSearches'), (s.usage && s.usage.web_searches) || 0);
+  setNum($('tSources'), srcs.length);
+  setNum($('tParts'), (s.done || 0) + '/' + (s.total || 0));
+
+  const d = s.durability || {};
+  const any = (d.interruptions || 0) + (d.saved_subquestions || 0) + (d.saved_searches || 0);
+  $('durability').className = 'durability' + (any > 0 ? ' on' : '');
+  setNum($('dInt'), d.interruptions || 0);
+  setNum($('dSaved'), d.saved_subquestions || 0);
+  setNum($('dSearch'), d.saved_searches || 0);
+
+  // Some sub-questions can fail permanently (a refusal, or retries exhausted) while
+  // the rest still produce a report. Say which, so a short report is explained
+  // rather than just short.
+  const failed = s.failed || [];
+  if (failed.length) {
+    $('runErr').textContent = failed.length + ' of ' + (s.total || 0)
+      + ' parts could not be researched; the report covers the rest.';
+  }
+
+  if (s.stage === 'failed') {
+    runFailed('This question could not be researched. Try rephrasing it.');
+    return;
+  }
+
+  if (s.stage === 'done') {
+    document.body.dataset.state = 'answer';
+    stopPolling();
+  }
+}
+
+/* ----------------------------------------------------------------- fleet */
+
+async function pollFleet() {
+  let f;
+  try { f = await (await fetch('/api/fleet')).json(); } catch { return; }
+
+  setNum($('tWorkers'), f.workers);
+  setNum($('tSpawned'), f.started);
+  $('tWorkers').classList.toggle('zero', f.workers === 0);
+  $('railWorkers').textContent = String(f.workers);
+  $('pulse').className = 'pulse' + (f.workers > 0 ? ' hot' : '');
+
+  peakSeen = Math.max(peakSeen, f.peak || 0, f.workers || 0);
+  $('railPeak').textContent = 'peak ' + peakSeen + ' · ' + f.started + ' spawned this session';
+
+  // Ring buffer. Client-side only, so it resets on reload — the right scope for a
+  // demo, and it means no server change to show the SHAPE of the burst.
+  spark.push(f.workers);
+  while (spark.length > SPARK_POINTS) spark.shift();
+  drawSpark($('railSpark'), 100, 34);
+  drawSpark($('footSpark'), 100, 30);
+  drawCells(f.workers);
+}
+
+/* ------------------------------------------------------- scheduling */
+
+// Phones spend the talk in pockets. Polling a hidden tab wastes the Temporal
+// frontend's time for nobody, and /api/fleet is shared by the whole room.
+function schedule() {
+  clearInterval(runTimer); clearInterval(fleetTimer);
+  runTimer = fleetTimer = null;
+  if (document.visibilityState !== 'visible') return;
+  fleetTimer = setInterval(pollFleet, FLEET_MS);
+  if (runId && !finished) runTimer = setInterval(pollRun, RUN_MS);
+}
+
+document.addEventListener('visibilitychange', () => {
+  schedule();
+  if (document.visibilityState === 'visible') {
+    pollFleet();
+    if (runId && !finished) pollRun();
+  }
+});
+
+/* ---------------------------------------------------------------- review */
+
+async function decide(decision) {
+  $('accept').disabled = $('refine').disabled = true;
+  try {
+    const res = await fetch('/api/run/' + runId + '/decision', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision, note: $('note').value || '' }),
+    });
+    // fetch resolves for ANY status, so without this check a failed Signal was
+    // reported as success: the card vanished, the attendee believed the draft was
+    // accepted, and the Workflow stayed parked for the full 2-hour review timeout.
+    if (!res.ok) throw new Error('That did not go through — try again.');
+    $('runErr').textContent = '';
+    $('reviewCard').hidden = true;
+    if (decision === 'refine') { finished = false; schedule(); }
+    pollRun();
+  } catch (err) {
+    // Leave the card up so the action is still available.
+    $('runErr').textContent = err.message;
+  } finally {
+    $('accept').disabled = $('refine').disabled = false;
+  }
+}
+
+/* ------------------------------------------------------------------ tabs */
+
+const TABS = ['report', 'parts', 'sources'];
+function setTab(name) {
+  document.body.dataset.tab = name;
+  for (const t of TABS) {
+    $('tab-' + t).setAttribute('aria-selected', String(t === name));
+  }
+}
+TABS.forEach((t) => $('tab-' + t).addEventListener('click', () => setTab(t)));
+$('tab-report').parentElement.addEventListener('keydown', (e) => {
+  const i = TABS.indexOf(document.body.dataset.tab);
+  if (e.key === 'ArrowRight') { setTab(TABS[(i + 1) % TABS.length]); $('tab-' + TABS[(i + 1) % TABS.length]).focus(); }
+  if (e.key === 'ArrowLeft') { setTab(TABS[(i + 2) % TABS.length]); $('tab-' + TABS[(i + 2) % TABS.length]).focus(); }
+});
+
+/* ----------------------------------------------------------------- learn */
+
+// The cards are <details> blocks in learn/README.md — a real document people also
+// read on GitHub, so it stays the single source of truth rather than being
+// duplicated into this page.
+//
+// The blocks NEST: each of the 14 cards contains an inner "✅ Check yourself"
+// details (27 tags for 14 cards). A non-greedy regex therefore cuts every card off
+// at its inner </details> and silently loses the rest, so this counts depth
+// instead and recurses, which renders the quizzes as nested cards for free.
+function splitDetails(src) {
+  const out = [];
+  let i = 0, pre = '';
+  while (i < src.length) {
+    const open = src.indexOf('<details', i);
+    if (open === -1) { pre += src.slice(i); break; }
+    pre += src.slice(i, open);
+
+    let depth = 0, j = open, end = -1;
+    while (j < src.length) {
+      const nO = src.indexOf('<details', j);
+      const nC = src.indexOf('</details>', j);
+      if (nC === -1) break;
+      if (nO !== -1 && nO < nC) { depth++; j = nO + 8; }
+      else {
+        depth--;
+        if (depth === 0) { end = nC; break; }
+        j = nC + 10;
+      }
+    }
+    if (end === -1) { pre += src.slice(open); break; }
+
+    const block = src.slice(open, end);
+    const sm = block.match(/<summary>([\s\S]*?)<\/summary>/);
+    const close = block.indexOf('</summary>');
+    out.push({
+      pre,
+      title: sm ? stripTags(sm[1]).trim() : 'Card',
+      body: close === -1 ? block.replace(/^<details[^>]*>/, '') : block.slice(close + 10),
+    });
+    pre = '';
+    i = end + 10;
+  }
+  if (pre.trim()) out.push({ pre, title: null, body: null });
+  return out;
+}
+
+function renderCards(container, src, depth) {
+  const frag = document.createDocumentFragment();
+  for (const part of splitDetails(src)) {
+    if (part.pre && part.pre.trim()) {
+      const box = el('div');
+      renderMarkdown(box, part.pre, { strip: true });
+      frag.append(box);
+    }
+    if (part.title == null) continue;
+    const card = el('details', 'card');
+    card.append(el('summary', null, part.title));
+    const cb = el('div', 'card-body');
+    // Recurse so an inner "Check yourself" stays collapsed rather than being
+    // flattened into the card body as stray prose.
+    if (depth < 3 && part.body.includes('<details')) renderCards(cb, part.body, depth + 1);
+    else renderMarkdown(cb, part.body, { strip: true });
+    card.append(cb);
+    frag.append(card);
+  }
+  container.replaceChildren(frag);
+}
+
+function renderLearn(md) {
+  renderCards($('learnBody'), md, 0);
+}
+
+async function openLearn() {
+  $('learnDlg').showModal();
+  if (learnLoaded) return;
+  try {
+    const res = await fetch('/api/learn');
+    if (!res.ok) throw new Error('unavailable');
+    renderLearn(await res.text());
+    learnLoaded = true;
+  } catch {
+    // Degrade to a clear message: this is the one asset that lives outside web/,
+    // so a missing Dockerfile COPY shows up here and nowhere else.
+    $('learnBody').replaceChildren(
+      el('p', 'err', 'Learn cards are unavailable in this deployment.'));
+  }
+}
+$('learnBtn').addEventListener('click', openLearn);
+$('learnClose').addEventListener('click', () => $('learnDlg').close());
+
+/* ------------------------------------------------------------------ wire */
+
+$('go').addEventListener('click', ask);
+$('q').addEventListener('input', () => {
+  $('count').textContent = $('q').value.length + '/500';
+});
+$('q').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ask();
+});
+$('accept').addEventListener('click', () => decide('accept'));
+$('refine').addEventListener('click', () => decide('refine'));
+
+pollFleet();
+if (runId) {
+  document.body.dataset.state = 'running';
+  beginRun();
+} else {
+  schedule();
+}
+</script>
+</body>
+</html>
