@@ -1,0 +1,22 @@
+# Keep the build context small — .venv is ~65 MB and bin/ is ~380 MB of
+# locally-built temporal CLI binaries. Neither belongs in the image.
+.venv/
+bin/
+__pycache__/
+*.pyc
+
+# Nothing in here belongs in the image.
+terraform/
+docs/
+decisions/
+learn/
+*.md
+.git/
+.gitignore
+
+# …except the Learn cards, which the page fetches at runtime from /api/learn.
+# This negation is load-bearing: `learn/` above excludes the directory, so without
+# it `COPY learn/README.md` fails the whole build with
+# `"/learn/README.md": not found`. An exclusion in .dockerignore removes the path
+# from the build CONTEXT, so no COPY can reach it.
+!learn/README.md

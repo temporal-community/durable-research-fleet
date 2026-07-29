@@ -1,0 +1,7 @@
+# Test-only dependencies. Not installed into the worker image.
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.24
+# pytest.ini sets `--timeout=120`; without this a fresh clone fails to collect at
+# all ("unrecognized arguments: --timeout=120"), not one test runs.
+pytest-timeout>=2.3
