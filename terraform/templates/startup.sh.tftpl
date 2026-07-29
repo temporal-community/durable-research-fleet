@@ -1,0 +1,179 @@
+#!/bin/bash
+# Provisions the self-hosted Temporal Service and registers the Worker
+# Deployment Version that carries the Cloud Run compute config.
+#
+# Runs on every boot and is idempotent, so a reboot re-converges. Re-run by hand
+# with: sudo systemctl restart google-startup-scripts
+#
+# Markers, so "did it work?" is answerable without reading the whole log:
+#   /var/log/bb-ready   written ONLY on full success
+#   /var/log/bb-failed  written on the first failing step, with the reason
+#   /var/log/bb-bootstrap.log   full transcript
+set -Eeuo pipefail
+exec > >(tee -a /var/log/bb-bootstrap.log) 2>&1
+
+STEP="starting"
+on_err() {
+  local rc=$?
+  echo "!!! BOOTSTRAP FAILED during: $STEP (exit $rc)"
+  echo "$STEP (exit $rc)" > /var/log/bb-failed
+  exit "$rc"
+}
+trap on_err ERR
+
+# A previous run's failure marker must not outlive this attempt.
+rm -f /var/log/bb-failed /var/log/bb-ready
+echo "=== bootstrap start $(date -Is) ==="
+
+# --- swap: e2-small is 2 GB, degrade instead of OOM ------------------------
+STEP="configuring swap"
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# --- fetch the main-branch temporal binary --------------------------------
+STEP="downloading temporal binary from gs://${bootstrap_bucket}/${cli_object}"
+install -d /opt/temporal /var/lib/temporal
+if [ ! -x /opt/temporal/temporal ]; then
+  ok=0
+  for i in $(seq 1 30); do
+    if gsutil -q cp "gs://${bootstrap_bucket}/${cli_object}" /opt/temporal/temporal.part; then
+      ok=1
+      break
+    fi
+    echo "  gsutil attempt $i failed; retrying in 10s"
+    sleep 10
+  done
+  # Explicit check: the loop above cannot use set -e to fail for us.
+  if [ "$ok" -ne 1 ] || [ ! -s /opt/temporal/temporal.part ]; then
+    false  # trips the ERR trap with STEP still set
+  fi
+  chmod +x /opt/temporal/temporal.part
+  mv /opt/temporal/temporal.part /opt/temporal/temporal
+fi
+
+STEP="verifying temporal binary"
+/opt/temporal/temporal --version
+
+# --- launcher ------------------------------------------------------------
+# A script rather than a bare ExecStart so systemd never parses the quoting
+# around the JSON dynamic-config values.
+#
+# --ip 0.0.0.0 matters: the default binds localhost, so the Worker Pool could
+# not reach it. The firewall keeps 7233 private to the subnet.
+STEP="writing launcher"
+cat > /opt/temporal/start.sh <<'LAUNCH'
+#!/bin/bash
+set -euo pipefail
+exec /opt/temporal/temporal server start-dev \
+  --ip 0.0.0.0 \
+  --port 7233 \
+  --http-port 7234 \
+  --ui-port 8233 \
+  --namespace ${temporal_namespace} \
+  --db-filename /var/lib/temporal/temporal.db \
+  --log-format json \
+  ${wci_flags}
+LAUNCH
+chmod +x /opt/temporal/start.sh
+
+STEP="writing systemd unit"
+cat > /etc/systemd/system/temporal.service <<'UNIT'
+[Unit]
+Description=Temporal (self-hosted, Worker Controller enabled)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/temporal/start.sh
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+# Let in-flight Workflow Tasks finish before the process is killed.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+STEP="starting temporal.service"
+systemctl daemon-reload
+systemctl enable temporal
+systemctl restart temporal
+
+# --- wait for SERVING -----------------------------------------------------
+STEP="waiting for Temporal to report SERVING"
+serving=0
+for i in $(seq 1 60); do
+  if /opt/temporal/temporal operator cluster health --address 127.0.0.1:7233 2>/dev/null | grep -q SERVING; then
+    echo "  SERVING after $i attempts"
+    serving=1
+    break
+  fi
+  sleep 5
+done
+if [ "$serving" -ne 1 ]; then
+  echo "  never reached SERVING; recent unit log:"
+  journalctl -u temporal --no-pager -n 40 || true
+  false
+fi
+
+T="/opt/temporal/temporal --address 127.0.0.1:7233 --namespace ${temporal_namespace}"
+
+# --- register the Worker Deployment + Version ----------------------------
+# `worker deployment create` pre-defines the deployment so create-version works
+# with NO worker having polled yet. That is the documented serverless path and
+# the only way to attach a compute provider before anything is running.
+# Already-exists is the expected steady state on re-runs, hence `|| true`.
+STEP="pre-defining Worker Deployment ${deployment_name}"
+$T worker deployment create --name ${deployment_name} 2>&1 | tail -2 || true
+
+STEP="attaching Cloud Run compute config to ${deployment_name}/${build_id}"
+if $T worker deployment describe-version \
+     --deployment-name ${deployment_name} --build-id ${build_id} >/dev/null 2>&1; then
+  echo "  version exists -> updating compute config"
+  $T worker deployment update-version-compute-config \
+    --deployment-name ${deployment_name} --build-id ${build_id} \
+    --gcp-cloud-run-project ${gcp_project} \
+    --gcp-cloud-run-region ${gcp_region} \
+    --gcp-cloud-run-worker-pool ${worker_pool} \
+    --gcp-cloud-run-service-account ${invoker_sa}
+else
+  echo "  creating version with compute config"
+  # IAM propagation for the invoker binding can lag ~60s after apply, and this
+  # is the first call that actually impersonates, so retry rather than fail the
+  # whole boot on a race.
+  created=0
+  for i in $(seq 1 10); do
+    if $T worker deployment create-version \
+         --deployment-name ${deployment_name} --build-id ${build_id} \
+         --gcp-cloud-run-project ${gcp_project} \
+         --gcp-cloud-run-region ${gcp_region} \
+         --gcp-cloud-run-worker-pool ${worker_pool} \
+         --gcp-cloud-run-service-account ${invoker_sa}; then
+      created=1
+      break
+    fi
+    echo "  create-version attempt $i failed (often IAM propagation); retrying in 15s"
+    sleep 15
+  done
+  [ "$created" -eq 1 ] || false
+fi
+
+STEP="setting ${deployment_name}/${build_id} current"
+$T worker deployment set-current-version \
+  --deployment-name ${deployment_name} --build-id ${build_id} --yes
+
+# --- verify, don't assume -------------------------------------------------
+STEP="verifying the version carries a compute config"
+$T worker deployment describe-version \
+  --deployment-name ${deployment_name} --build-id ${build_id} | tee /tmp/bb-version.txt
+grep -q 'gcp-cloud-run' /tmp/bb-version.txt
+
+touch /var/log/bb-ready
+echo "=== bootstrap done $(date -Is) ==="

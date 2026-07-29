@@ -1,0 +1,192 @@
+# Self-hosted Temporal for LOCAL DEVELOPMENT.
+#
+# Why not the usual one-service `temporalio/auto-setup` compose file: auto-setup
+# is only published up to 1.29.7, and Serverless Workers need >= 1.31.0. So we
+# run Postgres + a one-shot schema job + `temporalio/server:1.31.2` ourselves.
+#
+#   docker compose up -d --wait     # --wait blocks until healthchecks pass
+#   docker compose logs -f temporal
+#   docker compose down             # add -v to also drop Workflow history
+#
+# NOTE: this runs the RELEASED server, which cannot drive Cloud Run — it accepts
+# every workercontroller.* key and then fails create-version with "Could not
+# instantiate scaling algorithm with type 'rate-based'". For the path that works,
+# use ../terraform. See README.md.
+
+name: research-fleet-selfhosted
+
+# Postgres credentials in one place. Fine for a local dev stack; if you ever
+# expose this beyond localhost, move them to a .env file (gitignored) or Docker
+# secrets rather than leaving them inline.
+x-pg-env: &pg-env
+  POSTGRES_USER: &pg-user temporal
+  POSTGRES_PASSWORD: &pg-password temporal
+
+# Every long-running service gets the same restart + log policy. Without
+# log rotation a chatty server will happily fill the disk over days of uptime.
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgresql:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    environment:
+      <<: *pg-env
+      # Speeds up a throwaway dev database noticeably. Never do this where the
+      # data matters: it trades crash-durability for write speed.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: >
+      postgres
+        -c fsync=off
+        -c synchronous_commit=off
+        -c full_page_writes=off
+        -c max_connections=200
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -d matters: without a database, pg_isready can pass before the target
+      # database is actually connectable.
+      test: ["CMD-SHELL", "pg_isready -U temporal -d temporal || pg_isready -U temporal"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    # Bounded so a runaway query can't starve the host.
+    mem_limit: 1g
+    stop_grace_period: 30s
+
+  # One-shot: create both databases and load the schemas, then exit 0.
+  # Idempotent by design — re-running is the normal case, since `up` re-runs it
+  # on every start and it must be a no-op once the schema is current.
+  schema:
+    image: temporalio/admin-tools:1.31.2
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      SQL_PLUGIN: postgres12
+      SQL_HOST: postgresql
+      SQL_PORT: 5432
+      SQL_USER: *pg-user
+      SQL_PASSWORD: *pg-password
+    restart: "no"
+    # admin-tools is Alpine-based — /bin/sh (ash), no bash.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        base="--plugin $$SQL_PLUGIN --ep $$SQL_HOST --port $$SQL_PORT -u $$SQL_USER --pw $$SQL_PASSWORD"
+        schema_root=/etc/temporal/schema/postgresql/v12
+
+        # depends_on waits for the healthcheck, but a just-promoted Postgres can
+        # still refuse the first connection. Retry rather than fail the stack.
+        ready=0
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          if temporal-sql-tool $$base --db postgres ping >/dev/null 2>&1 \
+             || temporal-sql-tool $$base --db temporal create-database >/dev/null 2>&1 \
+             || true; then
+            ready=1; break
+          fi
+          echo "waiting for postgres ($$i)"; sleep 3
+        done
+        [ "$$ready" = "1" ] || { echo "postgres never became usable"; exit 1; }
+
+        for db in temporal temporal_visibility; do
+          echo "--- $$db ---"
+          temporal-sql-tool $$base --db $$db create-database || echo "  (database already exists)"
+          if temporal-sql-tool $$base --db $$db setup-schema -v 0.0 2>/dev/null; then
+            echo "  base schema created"
+          else
+            echo "  (base schema already present)"
+          fi
+        done
+
+        # These must succeed — a partially-migrated schema is worse than none.
+        temporal-sql-tool $$base --db temporal update-schema \
+          -d $$schema_root/temporal/versioned
+        temporal-sql-tool $$base --db temporal_visibility update-schema \
+          -d $$schema_root/visibility/versioned
+
+        echo "schema ready"
+
+  temporal:
+    <<: *service-defaults
+    image: temporalio/server:1.31.2
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      schema:
+        condition: service_completed_successfully
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: *pg-user
+      POSTGRES_PWD: *pg-password
+      POSTGRES_SEEDS: postgresql
+      # The full server DOES read a dynamic config file (unlike `start-dev`,
+      # which only takes repeated --dynamic-config-value flags — which is why
+      # ../terraform renders flags instead of shipping this file).
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/wci.yaml
+      # Keep a dev stack from silently running a stale schema.
+      SKIP_SCHEMA_SETUP: "true"
+      LOG_LEVEL: ${TEMPORAL_LOG_LEVEL:-info}
+      # No GOOGLE_APPLICATION_CREDENTIALS on purpose. On a GCE VM the container
+      # reaches the metadata server (169.254.169.254) through the Docker bridge
+      # and picks up the VM's attached service account as ADC automatically.
+      #
+      # Running this on a laptop instead? The WCI then has no GCP identity, so
+      # add your user ADC explicitly:
+      #   environment:
+      #     GOOGLE_APPLICATION_CREDENTIALS: /gcp/adc.json
+      #   volumes:
+      #     - ${HOME}/.config/gcloud/application_default_credentials.json:/gcp/adc.json:ro
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    # Host port is 7236 by default so this stack can coexist with another
+    # Temporal already bound to 7233. Override with FRONTEND_PORT.
+    ports:
+      - "${FRONTEND_PORT:-7236}:7233"
+    # The server image ships only `temporal-server` — no `temporal` CLI — so we
+    # probe the port instead of calling `operator cluster health`. Two traps:
+    # the frontend binds the container IP (not loopback, so 127.0.0.1 fails),
+    # and BusyBox nc has no usable -z.
+    healthcheck:
+      test: ["CMD-SHELL", "nc -w 1 $$(hostname -i) 7233 </dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    mem_limit: 1g
+    # Let in-flight Workflow Tasks finish instead of being SIGKILLed at 10s.
+    stop_grace_period: 30s
+
+  temporal-ui:
+    <<: *service-defaults
+    image: temporalio/ui:2.52.1
+    depends_on:
+      temporal:
+        # service_healthy, not service_started: the UI polls on boot and shows a
+        # connection error if it comes up before the frontend is listening.
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:${UI_PORT:-8236}
+      TEMPORAL_UI_PORT: 8080
+    ports:
+      - "${UI_PORT:-8236}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    mem_limit: 256m
+
+volumes:
+  pgdata:

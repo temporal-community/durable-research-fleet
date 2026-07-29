@@ -1,0 +1,24 @@
+# Enables the Worker Controller Instance (WCI) — the component that watches
+# Task Queues and scales your Cloud Run Worker Pool. Off by default.
+#
+# The server watches this file and applies changes live; no restart needed.
+# Scope to one Namespace by adding a `constraints: {namespace: your-ns}` clause
+# under any value.
+
+workercontroller.enabled:
+  - value: true
+
+workercontroller.compute_providers.enabled:
+  - value:
+      - gcp-cloud-run
+
+# Both are required for Cloud Run, and this is NOT what the published
+# self-hosted docs show — they list only `no-sync`, which is the Lambda setup.
+# With no-sync alone, create-version fails with:
+#   Could not instantiate scaling algorithm with type 'rate-based'
+# See KNOWLEDGE_BASE.md §7.2: Cloud Run combines immediate sync-match-failure
+# reaction (no-sync) with periodic rate-based resizing.
+workercontroller.scaling_algorithms.enabled:
+  - value:
+      - no-sync
+      - rate-based
