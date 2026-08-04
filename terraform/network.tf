@@ -30,6 +30,7 @@ resource "google_compute_firewall" "temporal_internal" {
   name          = "${local.prefix}-allow-temporal-internal"
   network       = google_compute_network.vpc.name
   description   = "Cloud Run Worker Pool -> Temporal frontend, private only"
+  priority      = 10
   source_ranges = [var.subnet_cidr]
   target_tags   = ["${local.prefix}-temporal"]
 
@@ -45,6 +46,7 @@ resource "google_compute_firewall" "ssh" {
   name          = "${local.prefix}-allow-ssh"
   network       = google_compute_network.vpc.name
   description   = "SSH for setup/debug, scoped to the operator"
+  priority      = 10
   source_ranges = local.ssh_ranges
   target_tags   = ["${local.prefix}-temporal"]
 
@@ -52,6 +54,35 @@ resource "google_compute_firewall" "ssh" {
     protocol = "tcp"
     ports    = ["22"]
   }
+}
+
+# Default-deny at the instance, added 2026-07-31 after an external port scan found
+# the Temporal Web UI answering unauthenticated on this VM's public IP:
+#
+#   $ curl http://<vm-public-ip>:8233/api/v1/namespaces
+#   {"namespaces":[{"namespaceInfo":{"name":"default", ...
+#
+# Nothing in this configuration opens 8233, so an allow rule was created outside
+# Terraform. GCP's implied deny does not help when an explicit allow exists, so the
+# only durable fix is a deny that outranks it. The two allows above sit at priority
+# 10 and this sits at 50, so anything created later at the default priority of 1000
+# — or anywhere above 50 — is inert.
+#
+# The exposure was not theoretical: the Web UI lists namespaces, lets you read every
+# Workflow's event history (the research questions and answers), and permits
+# terminate/cancel/signal, none of it authenticated.
+resource "google_compute_firewall" "deny_public_to_vm" {
+  name          = "${local.prefix}-deny-public"
+  network       = google_compute_network.vpc.name
+  description   = "Default-deny from the internet. Only the priority-10 allows above get through."
+  priority      = 50
+  direction     = "INGRESS"
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["${local.prefix}-temporal"]
+
+  deny { protocol = "tcp" }
+  deny { protocol = "udp" }
+  deny { protocol = "icmp" }
 }
 
 # Cloud Run Direct VPC egress leaves an address reservation behind on teardown.

@@ -101,9 +101,23 @@ run "iam_least_privilege_and_the_actas_binding" {
     error_message = "the Temporal VM must be able to impersonate the invoker"
   }
 
+  # The docs ask for run.developer "or equivalent". We grant the equivalent: the
+  # predefined role is project-wide and would also let the invoker delete the public
+  # web Service. Assert the custom role carries exactly the two verbs the WCI calls —
+  # if scaling breaks, this is the first place to look.
   assert {
-    condition     = google_project_iam_member.invoker_run_developer.role == "roles/run.developer"
-    error_message = "invoker needs run.workerPools.get + update"
+    condition = toset(google_project_iam_custom_role.worker_pool_scaler.permissions) == toset([
+      "run.workerPools.get",
+      "run.workerPools.update",
+    ])
+    error_message = "invoker needs exactly run.workerPools.get + update — no more, no less"
+  }
+
+  # The binding's `role` is the custom role's id, which is only known after apply, so
+  # assert on the role_id literal instead — this is a plan-only test suite.
+  assert {
+    condition     = google_project_iam_custom_role.worker_pool_scaler.role_id == "workerPoolScaler"
+    error_message = "the invoker must be bound to the custom scaler role, not roles/run.developer"
   }
 
   # Three distinct identities: the thing that can scale must not be able to run.
@@ -133,6 +147,33 @@ run "temporal_frontend_is_never_public" {
   assert {
     condition     = !contains(tolist(google_compute_firewall.ssh[0].source_ranges), "0.0.0.0/0")
     error_message = "SSH must be scoped to the operator, not the whole internet"
+  }
+
+  # The three assertions above only inspect the rules THIS configuration declares,
+  # which is exactly why they passed while the Web UI on :8233 was answering
+  # unauthenticated on the VM's public IP (2026-07-31). An allow rule created outside
+  # Terraform beat GCP's implied deny, and nothing here could see it.
+  #
+  # The default-deny is the structural fix, so assert its shape rather than trusting
+  # it: it has to cover the whole internet, and it has to outrank anything created
+  # later at the default priority of 1000.
+  assert {
+    condition     = google_compute_firewall.deny_public_to_vm.source_ranges == toset(["0.0.0.0/0"])
+    error_message = "the default-deny must cover the whole internet, or it is not a default"
+  }
+
+  assert {
+    condition     = google_compute_firewall.deny_public_to_vm.priority < 1000
+    error_message = "a deny at priority >= 1000 is inert against an allow created at the default priority"
+  }
+
+  # Ordering is the whole design: the two intended allows sit above the deny.
+  assert {
+    condition = alltrue([
+      google_compute_firewall.temporal_internal.priority < google_compute_firewall.deny_public_to_vm.priority,
+      google_compute_firewall.ssh[0].priority < google_compute_firewall.deny_public_to_vm.priority,
+    ])
+    error_message = "the intended allows must outrank the default-deny, or the VM is unreachable"
   }
 }
 
@@ -192,6 +233,28 @@ run "the_web_tier_is_a_service_not_a_worker_pool" {
   assert {
     condition     = contains(google_cloud_run_v2_service.web.template[0].containers[0].args, "web:app")
     error_message = "the web Service must run web:app"
+  }
+
+  # Added 2026-07-31. `invoker_iam_disabled = true` is Google's documented answer to
+  # domain-restricted sharing refusing an `allUsers` binding — and it produces the
+  # same exposure the org policy exists to prevent. Both halves are asserted because
+  # either one alone leaves the Service publicly invokable.
+  assert {
+    condition     = google_cloud_run_v2_service.web.invoker_iam_disabled == false
+    error_message = "invoker_iam_disabled = true makes this Service callable by anyone with the URL"
+  }
+
+  assert {
+    condition     = google_cloud_run_v2_service.web.ingress == "INGRESS_TRAFFIC_INTERNAL_ONLY"
+    error_message = "the web Service must not be internet-reachable; the presenter runs the console locally"
+  }
+
+  # The service name and region are both in this public repo, and Cloud Run's newer
+  # URL form is derivable from them, so "nobody can guess the hostname" is not a
+  # control. Access is named in-domain identities only, and none by default.
+  assert {
+    condition     = !contains(var.web_invoker_users, "allUsers") && !contains(var.web_invoker_users, "allAuthenticatedUsers")
+    error_message = "web_invoker_users is for named in-domain users; DRS rejects the special principals anyway"
   }
 
   # Same image as the pool: one build, one push, no version drift between tiers.
@@ -279,7 +342,7 @@ run "required_apis_are_enabled" {
         "iamcredentials.googleapis.com", # else: getAccessToken denied
         "iam.googleapis.com",            # else: SERVICE_DISABLED creating SAs
         "cloudresourcemanager.googleapis.com",
-        "secretmanager.googleapis.com",  # else: the pool can't read the Claude key
+        "secretmanager.googleapis.com", # else: the pool can't read the Claude key
       ] : contains(keys(google_project_service.apis), api)
     ])
     error_message = "a required API is missing from the enablement list"

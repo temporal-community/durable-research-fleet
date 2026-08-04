@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import time
 import uuid
 from datetime import timedelta
@@ -59,7 +60,12 @@ DEMO_PASSCODE = os.environ.get("DEMO_PASSCODE", "").strip()
 def _passcode_ok(supplied: str | None) -> bool:
     if not DEMO_PASSCODE:
         return True
-    return (supplied or "").strip().casefold() == DEMO_PASSCODE.casefold()
+    # compare_digest, not `==`. The timing signal on a short shared passcode over
+    # HTTPS is not a practical attack, but this is a public repo people copy from and
+    # `==` on a secret is the wrong thing to hand them.
+    return secrets.compare_digest(
+        (supplied or "").strip().casefold(), DEMO_PASSCODE.casefold()
+    )
 
 app = FastAPI(title="Research Agent on Temporal Serverless Workers")
 
@@ -211,11 +217,28 @@ async def run_state(workflow_id: str) -> JSONResponse:
 
 @app.post("/api/run/{workflow_id}/decision")
 async def decide(workflow_id: str, request: Request) -> dict:
-    """Send the review Signal — the event that wakes a pool sitting at zero."""
+    """Send the review Signal — the event that wakes a pool sitting at zero.
+
+    Guarded exactly like `/api/ask`, because it spends exactly like `/api/ask`: a
+    `refine` decision starts a SECOND fan-out. Without these two checks, knowing a run
+    id was enough to spend Claude tokens repeatedly, bypassing both the passcode and
+    the per-IP limit. Run ids are `research-<uuid4[:10]>` and there is no listing
+    endpoint, so they are not enumerable — but they are on screen in front of a room.
+    """
     body = await request.json()
     decision = (body.get("decision") or "").strip()
+
+    if not _passcode_ok(body.get("passcode")):
+        raise HTTPException(status_code=403, detail="Wrong passcode.")
     if decision not in ("accept", "refine"):
         raise HTTPException(status_code=400, detail="decision must be accept or refine")
+
+    # Only `refine` costs anything, so only `refine` consumes the budget. Rate-limiting
+    # `accept` would strand a finished run behind a cooldown for no benefit.
+    if decision == "refine" and _rate_limited(_client_ip(request)):
+        raise HTTPException(
+            status_code=429, detail="One at a time — give the last one a moment."
+        )
 
     note = (body.get("note") or "").strip()[:MAX_QUESTION_CHARS]
     client = await temporal()

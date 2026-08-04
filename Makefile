@@ -13,10 +13,16 @@
 # there is no way for them to drift onto different code.
 #
 # After `make up`, get the URLs and the two commands you'll want on stage:
-#   terraform -chdir=terraform output demo_url        # the room AND the projector
+#   terraform -chdir=terraform output web_service_url  # internal-ingress; NOT a public link
 #   terraform -chdir=terraform output set_anthropic_key
 #   terraform -chdir=terraform output chaos
+#
+# The console itself is served by `make web-local` over the SSH tunnel — the Cloud Run
+# Service is not internet-reachable on purpose (CLAUDE.md gate #12).
 
+# SET THIS. The default is the project this demo was built in, and you almost
+# certainly cannot deploy into it:
+#   make up AUTO=1 PROJECT=your-project-id
 PROJECT ?= serverless-workers-demo
 REGION  ?= us-central1
 ZONE    ?= us-central1-a
@@ -56,10 +62,19 @@ TF_VARS := \
   -var="build_id=$(BUILD_ID)"
 
 # Fail fast rather than half-deploying on a mismatch.
+#
+# The project check exists because PROJECT defaults to the project this demo was built
+# in. Anyone cloning the repo and running `make up` verbatim aimed at it and got a
+# permission error from somewhere deep in an apply, with nothing pointing at the cause.
 .PHONY: check-config
 check-config:
 	@case "$(ZONE)" in $(REGION)-*) ;; *) \
 	  echo "ERROR: ZONE=$(ZONE) is not in REGION=$(REGION)"; exit 1 ;; esac
+	@gcloud projects describe $(PROJECT) >/dev/null 2>&1 || { \
+	  echo "ERROR: cannot access PROJECT=$(PROJECT)."; \
+	  echo "       The default is the project this demo was built in — set your own:"; \
+	  echo "         make $(MAKECMDGOALS) PROJECT=your-project-id"; \
+	  exit 1; }
 
 .PHONY: help up down image cli plan apply destroy repo bootstrap-log ui tunnel status fmt check-config adopt register-queues test test-py test-tf verify web-local
 

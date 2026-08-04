@@ -43,7 +43,7 @@ returning to zero, over and over:
 No GCP and no Claude key needed for the infrastructure path.
 
 ```bash
-git clone org-195963520@github.com:temporal-community/durable-research-fleet.git
+git clone https://github.com/temporal-community/durable-research-fleet.git
 cd durable-research-fleet
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 ```
@@ -79,21 +79,40 @@ make web-local        # http://localhost:8000
 One question ≈ 6 sub-questions, ~90 web searches, 3–6 minutes, ~500K tokens.
 
 ```bash
-make test             # 111 offline tests — no server, no API key
+make test             # 113 offline tests — no server, no API key
 ```
 
 ---
 
 ## Deploy to GCP
 
+You need your own GCP project — `PROJECT` defaults to the one this demo was built in,
+which you can't deploy to. `make` checks that up front rather than failing deep inside
+an apply.
+
 ```bash
+export PROJECT=your-project-id
+
 make up AUTO=1            # CLI, Artifact Registry, image, secret, Terraform
 make register-queues      # once, so the Version learns its Task Queues
 make verify SCALE=1       # 16 checks, including a real scale-from-zero
 ```
 
-`terraform output demo_url` is the page you hand out. `AUTO=1` skips the plan
-prompt — without it `make up` cannot complete unattended.
+`AUTO=1` skips the plan prompt — without it `make up` cannot complete unattended.
+
+**Then serve the console locally against the deployed stack:**
+
+```bash
+make tunnel               # forwards the deployed Temporal frontend to localhost:7233
+make web-local            # http://localhost:8000
+```
+
+The Cloud Run web Service is deliberately **not** internet-reachable:
+internal ingress, invoker IAM on, and `roles/run.invoker`
+granted only to users you name in `web_invoker_users`. The fan-out and
+scale-from-zero you watch are still real Cloud Run Worker Pool behaviour — only the
+page serving is local. `CLAUDE.md` gate #12 has the full reasoning, including why
+`invoker_iam_disabled = true` looks like the answer and isn't.
 
 > **Serverless Workers is Pre-release.** The Cloud Run compute provider is not in a
 > released Temporal CLI or server — `make cli` builds one from `temporalio/cli@main`
@@ -110,9 +129,9 @@ has the command.
 ## How it works
 
 ```
-phone ──► Cloud Run Service (web.py) ──► Temporal ──► Cloud Run Worker Pool
-          request-serving, public          on a VM      long-polling Workers,
-          NOT a Serverless Worker                      scaled 0→N by the WCI
+browser ──► web.py ──────────────────► Temporal ──► Cloud Run Worker Pool
+            request-serving, IAM-only    on a VM      long-polling Workers,
+            NOT a Serverless Worker                   scaled 0→N by the WCI
 ```
 
 One image, two entrypoints: the pool runs the Worker, the Service overrides the
@@ -138,7 +157,7 @@ Locally you can skip all of it — the defaults target `temporal server start-de
 | `MAX_SUBQUESTIONS` | `6` | Fan-out width — this *is* the worker count one question lights up |
 | `RESEARCH_EFFORT` | `medium` | The biggest lever on how long the room waits |
 | `ANTHROPIC_API_KEY` | *unset* | Research app only; from Secret Manager in production |
-| `DEMO_PASSCODE` | *unset* | Web tier. Empty means anyone with the URL can spend tokens |
+| `DEMO_PASSCODE` | *unset* | Web tier. Guards both asking and approving — each spends tokens |
 
 Full list with reasoning lives in `runtime.py` and `research_activities.py`.
 
@@ -154,7 +173,7 @@ Full list with reasoning lives in `runtime.py` and `research_activities.py`.
 | `research_*.py` | Plan → fan out → draft → human review → optional second pass |
 | `web.py` · `web/` | The single-page console. Vanilla JS, no build step |
 | `terraform/` | The whole GCP stack, one `make up` |
-| `tests/` · `learn/` · `docs/` | 111 offline tests · eleven in-app learn cards · tutorial and knowledge base |
+| `tests/` · `learn/` · `docs/` | 113 offline tests · eleven in-app learn cards · tutorial and knowledge base |
 
 ---
 
