@@ -248,27 +248,49 @@ found locally or on a partial stack):
     `apply`; it seeds the real key, or a placeholder when `ANTHROPIC_API_KEY` is
     unset, and never clobbers an existing version. The old comment in
     `workerpool.tf` asserting an empty secret was tolerable has been corrected.
-12. **Public access uses `invoker_iam_disabled`, NOT an `allUsers` binding.** In
-    Temporal's org (`467666874571`, folder `80021838950`) Domain Restricted Sharing
-    rejects the public invoker binding with *"One or more users named in the policy
-    do not belong to a permitted customer"*, so the original
-    `google_cloud_run_v2_service_iam_member.web_public` could not be created and the
-    phone page 403'd the room. **Solved with `invoker_iam_disabled = true` on the
-    Service** (google provider ≥ 7.x; `--no-invoker-iam-check` in gcloud), which is
-    Google's documented remedy for exactly this constraint. Needs no org-level
-    change and no `roles/orgpolicy.policyAdmin` — which matters, because a project
-    owner **cannot** override an inherited org policy. Verified live: anonymous
-    `GET /` → 200.
-    - Same exposure as the binding it replaced, so **`demo_passcode` is no longer
-      optional.** It lives in `terraform/terraform.tfvars` (gitignored, auto-loaded)
-      rather than a `-var`, because a plain `make apply` would otherwise silently
-      reset it to `""` and leave the page open to any crawler.
-    - Two things that do **not** work here: an external HTTPS Load Balancer still
-      requires `allUsers` invoker on the Service, and the DRS-exception route needs
-      policy-admin at the org/folder plus custom org policies with resource tags.
-    - `gcloud run services proxy` is also a dead end on a Homebrew gcloud: it needs
-      a `cloud-run-proxy` binary that `components install` will not fetch (it
-      reports "All components are up to date" while the binary stays missing).
+12. **The web tier is NOT public. Don't make it public.** ⚠️ This gate said the
+    opposite until 2026-07-31 — it recommended `invoker_iam_disabled = true` — and
+    that recommendation was wrong. The history matters because the dead ends are real:
+    - Temporal's org enforces Domain Restricted Sharing, so an `allUsers` +
+      `roles/run.invoker` binding is refused outright (*"One or more users named in
+      the policy do not belong to a permitted customer"*). The original
+      `google_cloud_run_v2_service_iam_member.web_public` could not be created and the
+      phone page 403'd the room.
+    - `invoker_iam_disabled = true` (provider ≥ 7.x; `--no-invoker-iam-check`) is
+      Google's documented remedy for that constraint, and it **worked** — anonymous
+      `GET /` → 200. It also produces **exactly the exposure the org policy exists to
+      prevent**, and the Cloud Run console reports the Service as "Authentication:
+      Public Access" regardless of `ingress`. An external scan flagged it.
+    - **Current posture:** `ingress = INGRESS_TRAFFIC_INTERNAL_ONLY`,
+      `invoker_iam_disabled = false`, and `roles/run.invoker` granted only to named
+      in-domain users via `var.web_invoker_users` (empty by default). Asserted by
+      `terraform test` → `the_web_tier_is_a_service_not_a_worker_pool`.
+    - **The demo does not need a public page.** The presenter runs `make web-local`
+      against this project's Temporal over the SSH tunnel, so the fan-out and
+      scale-from-zero are still real Cloud Run behaviour with no public surface.
+    - "Nobody can guess the hostname" is not a control: Cloud Run's newer URL form is
+      `<service>-<project-number>.<region>.run.app`, and both the service name and the
+      region are in this public repo.
+    - `demo_passcode` stays set regardless. It lives in `terraform/terraform.tfvars`
+      (gitignored, auto-loaded) rather than a `-var`, because a plain `make apply`
+      would otherwise silently reset it to `""`.
+    - Other dead ends: an external HTTPS Load Balancer still requires `allUsers`
+      invoker on the Service; the DRS-exception route needs policy-admin at the
+      org/folder plus custom org policies with resource tags (a project owner
+      **cannot** override an inherited org policy); and `gcloud run services proxy`
+      needs a `cloud-run-proxy` binary that Homebrew gcloud's `components install`
+      will not fetch (it reports "All components are up to date" while the binary
+      stays missing).
+    - **12b — the VM's public IP had the Temporal Web UI open on `:8233`.** Same
+      2026-07-31 scan. Unauthenticated, it lists namespaces, exposes every Workflow's
+      event history (i.e. the research questions and answers) and permits
+      terminate/cancel/signal. Nothing in this configuration opened 8233 — an allow
+      rule was created outside Terraform, and GCP's implied deny cannot help once an
+      explicit allow exists. **Fixed structurally:** `deny_public_to_vm` in
+      `network.tf` denies all ingress from `0.0.0.0/0` at **priority 50**, while the
+      two intended allows (subnet→7233, operator→22) sit at **priority 10**. Anything
+      created later at the default priority of 1000 is inert. Don't renumber these
+      without reading `temporal_frontend_is_never_public`.
 
 13. **`.dockerignore` excludes `learn/`, so `COPY learn/README.md` needs a negation.**
     `!learn/README.md` is in `.dockerignore` and is load-bearing — an exclusion removes

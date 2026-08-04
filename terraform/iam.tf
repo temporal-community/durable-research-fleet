@@ -23,17 +23,33 @@ resource "google_service_account" "worker_rt" {
   depends_on   = [google_project_service.apis]
 }
 
-# run.developer covers run.workerPools.get + run.workerPools.update, the minimum
-# the invoker needs to resize the pool.
-resource "google_project_iam_member" "invoker_run_developer" {
+# The docs ask for "run.developer or equivalent (must include run.workerPools.get and
+# run.workerPools.update)". We grant the equivalent rather than the predefined role:
+# project-level roles/run.developer also lets the invoker create, update and DELETE
+# every other Cloud Run resource in this project — including the public web Service.
+# The invoker is the identity Temporal impersonates, so keep it to the two verbs the
+# WCI actually calls.
+#
+# If scaling ever stops working after touching this, the missing permission shows up
+# in the Temporal server log, not in GCP:
+#   sudo journalctl -u temporal | grep UpdateWorkerSetSize
+resource "google_project_iam_custom_role" "worker_pool_scaler" {
+  role_id     = "workerPoolScaler"
+  title       = "Serverless Workers — Worker Pool scaler"
+  description = "Minimum for the Temporal invoker SA to read and resize a Cloud Run Worker Pool."
+  permissions = [
+    "run.workerPools.get",
+    "run.workerPools.update",
+  ]
+}
+
+resource "google_project_iam_member" "invoker_pool_scaler" {
   project = var.project_id
-  role    = "roles/run.developer"
+  role    = google_project_iam_custom_role.worker_pool_scaler.id
   member  = "serviceAccount:${google_service_account.invoker.email}"
 }
 
-# THE non-obvious one. run.developer gives the invoker run.workerPools.get and
-# run.workerPools.update, which is all KNOWLEDGE_BASE.md §7.6 (and the upstream
-# Terraform module) asks for — but it is NOT sufficient.
+# The pool-scaling permissions above are not sufficient on their own.
 #
 # A Worker Pool's template names a runtime service account, so resizing the pool
 # is an update that "sets" that identity, and Cloud Run therefore requires
@@ -46,6 +62,10 @@ resource "google_project_iam_member" "invoker_run_developer" {
 #
 # and the pool silently never scales — the error only appears in the Temporal
 # server's own debug log, not anywhere in GCP.
+#
+# This is documented: docs.temporal.io/production-deployment/worker-deployments/
+# serverless-workers/cloud-run#runner-service-account. It is still the easiest
+# binding to omit, because nothing tells you it is missing.
 resource "google_service_account_iam_member" "invoker_acts_as_worker_rt" {
   service_account_id = google_service_account.worker_rt.name
   role               = "roles/iam.serviceAccountUser"

@@ -464,6 +464,20 @@ function drawCells(n) {
 
 /* ------------------------------------------------------------------- ask */
 
+/* The passcode now guards the review Signal as well as the ask, and the review card
+   can be reached by reloading /r/<id> — a tab that never typed a passcode. So the
+   working one is remembered for the session, and `revealPass()` gets the attendee out
+   of a 403 from either endpoint. sessionStorage, not localStorage: the scope is this
+   tab and this demo. */
+function passcode() {
+  return $('passcode').value || sessionStorage.getItem('passcode') || '';
+}
+
+function revealPass(message) {
+  if (!/passcode/i.test(message)) return;
+  $('passField').style.display = 'block';
+}
+
 async function ask() {
   const question = $('q').value.trim();
   $('askErr').textContent = '';
@@ -475,10 +489,12 @@ async function ask() {
     const res = await fetch('/api/ask', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ question, passcode: $('passcode').value || '' }),
+      body: JSON.stringify({ question, passcode: passcode() }),
     });
     const body = await res.json();
     if (!res.ok) throw new Error(body.detail || 'Could not start.');
+    // It got through, so it is the right one — keep it for the review Signal later.
+    sessionStorage.setItem('passcode', passcode());
     runId = body.id;
     startedAt = Date.now();
     history.replaceState({}, '', '/r/' + runId);
@@ -488,7 +504,7 @@ async function ask() {
     beginRun();
   } catch (err) {
     $('askErr').textContent = err.message;
-    if (/passcode/i.test(err.message)) $('passField').style.display = 'block';
+    revealPass(err.message);
     $('go').disabled = false;
     $('go').textContent = 'Research it';
   }
@@ -735,12 +751,24 @@ async function decide(decision) {
     const res = await fetch('/api/run/' + runId + '/decision', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ decision, note: $('note').value || '' }),
+      // The passcode rides along: /api/run/{id}/decision enforces it too, because a
+      // `refine` starts a second fan-out and costs the same as a fresh question.
+      body: JSON.stringify({
+        decision,
+        note: $('note').value || '',
+        passcode: passcode(),
+      }),
     });
     // fetch resolves for ANY status, so without this check a failed Signal was
     // reported as success: the card vanished, the attendee believed the draft was
     // accepted, and the Workflow stayed parked for the full 2-hour review timeout.
-    if (!res.ok) throw new Error('That did not go through — try again.');
+    //
+    // 403 and 429 carry a `detail` worth showing — a generic "try again" on a wrong
+    // passcode is unrecoverable, because the field it refers to is hidden.
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || 'That did not go through — try again.');
+    }
     $('runErr').textContent = '';
     $('reviewCard').hidden = true;
     if (decision === 'refine') { finished = false; schedule(); }
@@ -748,6 +776,7 @@ async function decide(decision) {
   } catch (err) {
     // Leave the card up so the action is still available.
     $('runErr').textContent = err.message;
+    revealPass(err.message);
   } finally {
     $('accept').disabled = $('refine').disabled = false;
   }

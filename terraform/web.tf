@@ -36,25 +36,32 @@ resource "google_cloud_run_v2_service" "web" {
   # and the provider default of true makes `terraform destroy` fail partway.
   deletion_protection = false
 
-  # Public page. See the note further down for why that is a deliberate, bounded
-  # decision rather than an oversight.
-  ingress = "INGRESS_TRAFFIC_ALL"
+  # NOT internet-reachable. Changed 2026-07-31 after security flagged the public
+  # endpoint: Cloud Run's newer URL form is `<service>-<project-number>.<region>
+  # .run.app`, and both the service name and region are in this public repo, so the
+  # hostname was derivable rather than obscure. The earlier "nobody can find it"
+  # reasoning (wildcard cert, so no Certificate Transparency entry) did not hold.
+  #
+  # The demo no longer depends on this Service. The presenter runs the console
+  # locally (`make web-local`) against this project's Temporal over the SSH tunnel,
+  # so the fan-out and scale-from-zero are still real Cloud Run behaviour with no
+  # public surface. Set this back to INGRESS_TRAFFIC_ALL only with a documented
+  # org-policy exception, not by reaching for invoker_iam_disabled again.
+  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
-  # This is what makes the page reachable, NOT an `allUsers` IAM binding.
+  # Authentication required. This was `true` until 2026-07-31.
   #
-  # Discovered on the first real deploy, 2026-07-29: this org enforces
-  # domain-restricted sharing, so granting `allUsers` roles/run.invoker is refused
-  # outright ("One or more users named in the policy do not belong to a permitted
-  # customer"). Google's own guidance for that case is to disable the invoker IAM
-  # check rather than fight the policy — it needs no org-level change and no
-  # policy-admin role, which matters because a project owner cannot override an
-  # inherited org policy.
+  # History, because the reasoning matters: this org enforces domain-restricted
+  # sharing, so `allUsers` + roles/run.invoker is refused outright. Disabling the
+  # invoker IAM check is Google's documented answer to that, and it worked — but it
+  # produces exactly the same exposure as the binding the org policy exists to
+  # prevent, and the Cloud Run console reports the Service as "Authentication:
+  # Public Access" no matter what `ingress` is set to. That is what security's scan
+  # sees, so internal-only ingress alone does not close the finding.
   #
-  # Same exposure as the `allUsers` binding it replaces: anyone with the URL can
-  # call this Service. The four bounding controls listed below are what make that
-  # acceptable, and `demo_passcode` is no longer optional now that this is the
-  # mechanism — an empty passcode means a stray crawler can spend Claude tokens.
-  invoker_iam_disabled = true
+  # Access is now an ordinary IAM grant to named identities (below), which are
+  # in-domain and therefore permitted by the policy. Nothing is granted by default.
+  invoker_iam_disabled = false
 
   template {
     service_account = google_service_account.web_rt.email
@@ -184,8 +191,18 @@ resource "google_cloud_run_v2_service" "web" {
 #
 # It cannot be created in this organization. Domain-restricted sharing rejects the
 # special principals `allUsers` and `allAuthenticatedUsers`, so the apply failed
-# with HTTP 400 while the other 24 resources came up clean. Public access is now
-# achieved by `invoker_iam_disabled = true` on the Service above.
+# with HTTP 400 while the other 24 resources came up clean.
+#
+# It is no longer wanted either. Access is named identities only:
+resource "google_cloud_run_v2_service_iam_member" "web_invokers" {
+  for_each = toset(var.web_invoker_users)
+
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.web.name
+  role     = "roles/run.invoker"
+  member   = "user:${each.value}"
+}
 #
 # Don't reintroduce this binding. The alternatives that do NOT work here:
 #   - an external HTTPS Load Balancer in front of Cloud Run still requires

@@ -1,11 +1,15 @@
+# Every ceiling here is a major-version bound, not a pin. This repo gets cloned
+# months after it was last touched, and an unbounded floor means a future major
+# silently rewrites the build — `anthropic` is pre-1.0, so its minors are the
+# breaking ones and `<1` is the real ceiling.
 temporalio>=1.30.0,<2
 
 # The research app. `anthropic` is imported only by llm.py / research_activities.py,
 # so the hello app (and `make verify SCALE=1`) still runs without a Claude key.
-anthropic>=0.116.0
+anthropic>=0.116.0,<1
 
 # The web tier. Same image as the Worker — Cloud Run overrides the container
 # command to run uvicorn instead of the Worker, so there is one image to build
 # and push. pydantic arrives with fastapi and is used for structured outputs.
-fastapi>=0.115
-uvicorn[standard]>=0.32
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1

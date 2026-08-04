@@ -25,8 +25,14 @@ output "worker_image" {
 # on 2026-07-29: the console carries the fleet counters in its footer and scales
 # them with the viewport, so the same page serves a phone in a seat and a screen at
 # the front of the room. There is deliberately no `dashboard_url` output any more.
-output "demo_url" {
-  description = "Give this to the room, and put it on the projector too."
+#
+# NOT hand-out-able since 2026-07-31. The Service is internal-ingress with invoker IAM
+# on (CLAUDE.md gate #12), so this URL 403s for anyone not named in
+# `var.web_invoker_users`. Kept because it is still how you identify the revision and
+# tail its logs. To actually serve the console, run `make web-local` against this
+# project's Temporal over the SSH tunnel.
+output "web_service_url" {
+  description = "The web Service's URL. Internal-ingress + IAM: not a public link."
   value       = google_cloud_run_v2_service.web.uri
 }
 

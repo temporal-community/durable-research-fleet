@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+.DS_Store
 
 # Terraform state can contain sensitive values — never commit it.
 # Glob every state variant: Terraform writes timestamped backups

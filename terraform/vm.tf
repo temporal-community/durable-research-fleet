@@ -16,9 +16,18 @@ resource "google_compute_instance" "temporal" {
     subnetwork = google_compute_subnetwork.subnet.id
     network_ip = google_compute_address.temporal_internal.address
 
-    # Ephemeral external IP purely for outbound package/binary fetches. No
-    # ingress is opened to it beyond the scoped SSH rule. Swap for Cloud NAT if
-    # you want zero public addresses.
+    # Ephemeral external IP purely for outbound package/binary fetches.
+    #
+    # This comment used to say "no ingress is opened to it beyond the scoped SSH
+    # rule". That was true of THIS configuration and still false in practice: on
+    # 2026-07-31 an external scan found the Temporal Web UI answering unauthenticated
+    # on this address, via an allow rule created outside Terraform. A public IP on a
+    # VM running an unauthenticated Temporal frontend is the thing to be careful
+    # about, so the guarantee now comes from the priority-50 default-deny in
+    # network.tf rather than from the absence of an allow rule here.
+    #
+    # Swap for Cloud NAT if you want zero public addresses — that removes the class
+    # of problem entirely, at the cost of a NAT gateway.
     access_config {}
   }
 
@@ -47,7 +56,7 @@ resource "google_compute_instance" "temporal" {
   # VM's first boot fails in a way that needs a manual re-run.
   depends_on = [
     google_service_account_iam_member.vm_impersonates_invoker,
-    google_project_iam_member.invoker_run_developer,
+    google_project_iam_member.invoker_pool_scaler,
     google_storage_bucket_iam_member.vm_reads_bootstrap,
     google_storage_bucket_object.temporal_cli,
     google_cloud_run_v2_worker_pool.fleet,

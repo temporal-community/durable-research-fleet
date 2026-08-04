@@ -186,6 +186,12 @@ variable "impersonator_user_emails" {
   default     = []
 }
 
+variable "web_invoker_users" {
+  description = "In-domain user accounts granted roles/run.invoker on the web Service. Empty — the default — means nobody can call it, which is correct now that the presenter runs the console locally against this project's Temporal. Never put allUsers or allAuthenticatedUsers here: domain-restricted sharing rejects them, and unauthenticated invocation is exactly what security flagged on 2026-07-31."
+  type        = list(string)
+  default     = []
+}
+
 variable "max_subquestions" {
   description = "Fan-out width: how many sub-questions one question becomes. With one Activity slot per instance this IS the Serverless Worker count the room watches. The planner always returns the top of its range, so this value — not the wording of the question — decides the width. 6 is the full demo; 3 gives a smaller, faster fan-out."
   type        = number

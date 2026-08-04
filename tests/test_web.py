@@ -106,6 +106,35 @@ def test_no_passcode_configured_means_open(monkeypatch):
     assert web._passcode_ok("anything")
 
 
+def test_every_endpoint_that_spends_money_checks_the_passcode():
+    """REGRESSION, found reviewing the Code Exchange submission. `/api/ask` was
+    guarded by both the passcode and the per-IP limit; `/api/run/{id}/decision` was
+    guarded by neither — yet a `refine` decision starts a SECOND fan-out and costs the
+    same as a fresh question. Knowing a run id was enough to spend Claude tokens
+    repeatedly, bypassing both controls.
+
+    Asserted on the source because exercising it needs a Temporal client: the guards
+    have to run BEFORE the Signal is sent, and a test that mocked the client away
+    would pass with the checks in the wrong order.
+    """
+    src = inspect.getsource(web.decide)
+    assert "_passcode_ok" in src, "the review Signal must check the passcode"
+    assert "_rate_limited" in src, "a refine starts a second fan-out; bound it"
+
+    # Order matters: both guards precede the Signal, or they guard nothing.
+    assert src.index("_passcode_ok") < src.index('signal("review"')
+    assert src.index("_rate_limited") < src.index('signal("review"')
+
+
+def test_the_passcode_comparison_is_constant_time():
+    """`==` on a secret is the wrong pattern to publish in a repo people copy from,
+    and it is what static scanners flag. The timing signal on a short shared passcode
+    over HTTPS is not a practical attack — this is about what the example teaches.
+    """
+    src = inspect.getsource(web._passcode_ok)
+    assert "compare_digest" in src
+
+
 def test_there_is_no_run_listing_endpoint():
     """Run ids are `research-<uuid4 hex>`, so /api/run/{id} is capability-based —
     you can only read a run whose link you were given. An endpoint enumerating those
