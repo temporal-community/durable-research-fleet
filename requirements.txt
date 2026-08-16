@@ -1,12 +1,11 @@
 # Every ceiling here is a major-version bound, not a pin. This repo gets cloned
 # months after it was last touched, and an unbounded floor means a future major
-# silently rewrites the build — `anthropic` is pre-1.0, so its minors are the
-# breaking ones and `<1` is the real ceiling.
+# silently rewrites the build.
 temporalio>=1.30.0,<2
 
-# The research app. `anthropic` is imported only by llm.py / research_activities.py,
-# so the hello app (and `make verify SCALE=1`) still runs without a Claude key.
-anthropic>=0.116.0,<1
+# The research app. google-genai is imported only by llm.py, and the client is
+# lazy, so the hello app still starts without a Gemini API key.
+google-genai>=2.6.0,<3
 
 # The web tier. Same image as the Worker — Cloud Run overrides the container
 # command to run uvicorn instead of the Worker, so there is one image to build

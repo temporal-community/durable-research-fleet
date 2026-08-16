@@ -25,7 +25,7 @@ def test_client_ip_never_trusts_the_first_forwarded_hop(monkeypatch):
     """REGRESSION. Google's front end APPENDS to whatever X-Forwarded-For the client
     sent, so the FIRST entry is attacker-chosen. Reading it let a caller rotate the
     header for a fresh rate-limit bucket per request, making the limit inert and
-    unbounded Claude spend reachable by anyone with the URL.
+    unbounded Gemini spend reachable by anyone with the URL.
     """
     monkeypatch.setattr(web, "_TRUST_XFF", True)
     monkeypatch.setattr(web, "XFF_HOPS_FROM_END", 1)
@@ -110,7 +110,7 @@ def test_every_endpoint_that_spends_money_checks_the_passcode():
     """REGRESSION, found reviewing the Code Exchange submission. `/api/ask` was
     guarded by both the passcode and the per-IP limit; `/api/run/{id}/decision` was
     guarded by neither — yet a `refine` decision starts a SECOND fan-out and costs the
-    same as a fresh question. Knowing a run id was enough to spend Claude tokens
+    same as a fresh question. Knowing a run id was enough to spend Gemini tokens
     repeatedly, bypassing both controls.
 
     Asserted on the source because exercising it needs a Temporal client: the guards

@@ -31,7 +31,7 @@ One KB section was found to be **wrong** and has been corrected (§7.6).
 
 ### §7.6 — the IAM list was incomplete (the big one)
 
-The KB said the invoker needs `run.workerPools.get` + `run.workerPools.update`
+The KB said the invoker needs `run.workerpools.get` + `run.workerpools.update`
 (`roles/run.developer`). That is **not sufficient**. It also needs
 `iam.serviceAccounts.actAs` on the Worker Pool's **runtime** service account,
 because a pool template names a runtime identity and resizing the pool is an

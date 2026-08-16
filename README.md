@@ -1,187 +1,227 @@
-# Durable Research Fleet
+<div align="center">
 
-A deep-research agent that runs on **Temporal Serverless Workers** on Google Cloud Run.
+[![Temporal](https://img.shields.io/badge/Temporal-Serverless%20Workers-141414?logo=temporal&logoColor=white)](https://temporal.io)
+[![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Run%20Worker%20Pools-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/run/docs/workerpools)
+[![Gemini](https://img.shields.io/badge/Gemini-3.6%20Flash-8E75B2?logo=googlegemini&logoColor=white)](https://ai.google.dev/gemini-api/docs)
+[![Tests](https://img.shields.io/badge/tests-115%20passing-22C55E)](#test-it)
+[![License](https://img.shields.io/badge/license-Apache--2.0-orange)](LICENSE)
 
-Ask a question from your phone. It splits into ~6 independent sub-questions, each
-researched in parallel by a Cloud Run instance that **did not exist a second ago**,
-then merged into one cited report. The pool scales `0 → N → 0` on its own.
+</div>
 
-![The research console](docs/images/hero-console.png)
+# Durable Research Fleet — Gemini Edition
 
----
+**Ask once. Watch a fleet appear, research in parallel, and disappear — while the Workflow stays alive.**
 
-## What you're looking at
+A conference-ready deep-research demo powered by **Temporal Serverless Workers**, **Google Cloud Run**, and **Gemini with Google Search grounding**.
 
-Outline on the left, the cited report in the middle, sources on the right, live fleet
-counters along the bottom. When the draft is ready the Workflow parks and waits for
-you — that's `WAITING FOR YOU`, with the review card in the left rail.
+One question becomes up to six independent research jobs. Each job maps to one Cloud Run Worker, the pool scales `0 → N → 0`, and Temporal preserves the plan, findings, report, and human-review pause throughout.
+
+> **🎬 See the story:** ask from the workbench, watch Serverless Workers climb in the sticky footer, review the cited draft, then approve it after the pool has returned to zero.
+
+![The research workbench](docs/images/hero-console.png)
+
+### ✨ Key demo moments
+
+| Moment | What happens | Why it matters |
+|---|---|---|
+| 🔀 **Research fan-out** | One question becomes ~6 independent sub-questions | Parallel work creates real Task Queue backlog |
+| 🚀 **Workers from zero** | Cloud Run adds one-slot Workers to meet that backlog | The fleet is created for the work, not kept warm |
+| 🔎 **Grounded research** | Gemini researches with server-side Google Search | Findings return with sources instead of unsupported prose |
+| ⏸️ **Durable review** | The Workflow parks with a finished draft and no active task | State survives without an app server or database holding the request open |
+| ⚡ **Wake from zero** | Accept or refine sends a Temporal Signal | A live Workflow wakes even after the Worker Pool has scaled away |
+
+> **Last live infrastructure verification — August 15, 2026:** 16/16 deployment checks passed. Five queued smoke-test Workflows took the Worker Pool from **0 to 4 instances in 20 seconds**. The smoke test uses no Gemini tokens.
+
+## 🏗 Why this architecture?
+
+> **Traditional approach:** one long-running app process owns the request. If it dies mid-research, orchestration state and completed work need to be reconstructed.
+>
+> **This approach:** Temporal owns the durable execution. Cloud Run Workers are disposable compute. A replacement Worker can continue from event history without rerunning sibling research that already finished.
+
+```mermaid
+flowchart LR
+    U["📱 Browser / projector"] --> W["🧭 Research workbench<br/>FastAPI + vanilla JS"]
+    W --> T["⏳ Temporal<br/>durable source of truth"]
+    T --> Q["📬 research-queue"]
+    Q --> P["☁️ Cloud Run Worker Pool<br/>0 → N → 0"]
+    P --> G["✨ Gemini 3.6 Flash<br/>Google Search grounding"]
+    G --> P
+    P --> T
+    T -. "Worker Controller scales" .-> P
+```
+
+There is no application database. The workbench is a projection of the Workflow's `progress` Query; the durable state lives in Temporal event history.
+
+## The proof on screen
+
+The outline sits on the left, the cited report in the middle, sources on the right, and live fleet counters along the bottom. When the draft is ready, `WAITING FOR YOU` appears with the review card.
 
 ![Live fleet counters](docs/images/footer-workers.png)
 
-Two beats make the demo:
+Temporal shows six `research_subquestion` Activities overlapping, followed by synthesis and a timer ended early by the human-review Signal:
 
-- **Fan-out** — six sub-question Activities are scheduled at once. One Activity slot
-  per instance means most can't be picked up by the current pool, so the Worker
-  Controller scales out to meet them.
-- **Wake from zero** — after the draft the Workflow holds no task at all, so the pool
-  drops to **zero with a live Workflow still in flight**. Your approval wakes it.
+![Temporal timeline: concurrent research followed by review](docs/images/temporal-timeline.png)
 
-Temporal's timeline shows both: six `research_subquestion` Activities overlapping,
-then `synthesize`, then a 2-hour timer ended early by the `review` Signal.
+Cloud Run shows the same story from the infrastructure side:
 
-![Temporal timeline: six concurrent activities, then the review pause](docs/images/temporal-timeline.png)
+![Cloud Run Worker Pool scaling from zero](docs/images/cloud-run-pool.png)
 
-And Cloud Run's own metrics, from the other side — instance count climbing and
-returning to zero, over and over:
+## 5-minute local quickstart
 
-![Cloud Run worker pool scaling from zero](docs/images/cloud-run-pool.png)
-
----
-
-## Run it locally
-
-No GCP and no Claude key needed for the infrastructure path.
+The infrastructure path needs neither GCP nor a Gemini key.
 
 ```bash
-git clone https://github.com/temporal-community/durable-research-fleet.git
-cd durable-research-fleet
-python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+git clone <your-fork-url> durable-research-fleet-gemini
+cd durable-research-fleet-gemini
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
 ```
 
+Run these in separate terminals:
+
 ```bash
-# 1 — Temporal dev server (Web UI on http://localhost:8233)
+# 1 — Temporal dev server; Web UI at http://localhost:8233
 temporal server start-dev
 
-# 2 — the Worker
+# 2 — versioned local Worker
 .venv/bin/python worker_local.py
 
-# 3 — one-time, AFTER the Worker is polling
+# 3 — one-time, AFTER the Worker begins polling
 temporal worker deployment set-current-version \
   --deployment-name research-fleet --build-id local --yes
 
-# 4 — a Workflow, then a burst
+# 4 — one Workflow, then a five-Workflow burst
 .venv/bin/python starter.py --watch
 .venv/bin/python starter.py --count 5 --watch
 ```
 
-Step 3 is not optional: every Workflow here declares a versioning behavior, and an
-unversioned Worker gets **every** Workflow Task rejected.
+Step 3 is required: every Workflow declares a versioning behavior, so Temporal rejects its Workflow Tasks when the Worker is not in versioned mode.
 
-### The research agent
+### Run the Gemini research app
 
-Needs `ANTHROPIC_API_KEY` — put it in `.env`, which is gitignored.
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-make web-local        # http://localhost:8000
-```
-
-One question ≈ 6 sub-questions, ~90 web searches, 3–6 minutes, ~500K tokens.
+Create a `GEMINI_API_KEY` in [Google AI Studio](https://aistudio.google.com/apikey), place it in the gitignored `.env`, then restart the Worker with local-only parallelism:
 
 ```bash
-make test             # 113 offline tests — no server, no API key
+set -a; . ./.env; set +a
+MAX_CONCURRENT_ACTIVITIES=6 .venv/bin/python worker_local.py
+make web-local
 ```
 
----
+Open **http://localhost:8000**. One run uses one planning call, up to six grounded research calls, and one synthesis call. A refine decision may trigger one additional bounded fan-out.
+
+The higher slot count is only for local development. Keep the deployed value at `1`: one Activity slot per instance is what turns a six-way fan-out into a visible Serverless Worker fleet.
 
 ## Deploy to GCP
 
-You need your own GCP project — `PROJECT` defaults to the one this demo was built in,
-which you can't deploy to. `make` checks that up front rather than failing deep inside
-an apply.
+You need a GCP project, `gcloud`, Docker, Terraform, and a Gemini key. `PROJECT` must be set explicitly unless you own the repository's default demo project.
 
 ```bash
-export PROJECT=your-project-id
+export GEMINI_API_KEY=your-key
 
-make up AUTO=1            # CLI, Artifact Registry, image, secret, Terraform
-make register-queues      # once, so the Version learns its Task Queues
-make verify SCALE=1       # 16 checks, including a real scale-from-zero
+make up AUTO=1 PROJECT=your-project-id
+make register-queues PROJECT=your-project-id
+make verify SCALE=1 PROJECT=your-project-id
 ```
 
-`AUTO=1` skips the plan prompt — without it `make up` cannot complete unattended.
+That sequence builds the unreleased Temporal CLI needed for the Cloud Run provider, creates the GCP stack, seeds Secret Manager without putting the key in Terraform state, registers the Task Queues, and proves scale-from-zero.
 
-**Then serve the console locally against the deployed stack:**
+> **Serverless Workers is Pre-release.** The Cloud Run provider is not in a released Temporal CLI/server. `make cli` builds the required main-branch CLI with the upstream Cloud Run field-mask fix pinned in, and Terraform ships it to the VM.
+
+### Open the deployed workbench
+
+The Cloud Run web Service is intentionally **internal-only**. Opening its `run.app` URL from a public browser should fail; that is the security boundary, not a broken deployment.
+
+Serve the same workbench locally while it drives the real deployed Temporal and Cloud Run fleet:
 
 ```bash
-make tunnel               # forwards the deployed Temporal frontend to localhost:7233
-make web-local            # http://localhost:8000
+# Terminal 1 — leave running
+make tunnel PROJECT=your-project-id
+
+# Terminal 2
+make web-local
 ```
 
-The Cloud Run web Service is deliberately **not** internet-reachable:
-internal ingress, invoker IAM on, and `roles/run.invoker`
-granted only to users you name in `web_invoker_users`. The fan-out and
-scale-from-zero you watch are still real Cloud Run Worker Pool behaviour — only the
-page serving is local. `CLAUDE.md` gate #12 has the full reasoning, including why
-`invoker_iam_disabled = true` looks like the answer and isn't.
+Then open **http://localhost:8000**. If port `7233` is already occupied, use:
 
-> **Serverless Workers is Pre-release.** The Cloud Run compute provider is not in a
-> released Temporal CLI or server — `make cli` builds one from `temporalio/cli@main`
-> and Terraform ships it to the VM. Temporal Cloud additionally needs Pre-release
-> access on your Namespace; self-hosted does not. See `docs/TUTORIAL.md`.
-
-One trap worth knowing: **after a rebuild, force the pool onto the new digest.**
-Pushing the same image tag does not redeploy it — Cloud Run pins the digest when a
-revision is created, so new worker code silently never arrives. `CLAUDE.md` gate #14
-has the command.
-
----
-
-## How it works
-
-```
-browser ──► web.py ──────────────────► Temporal ──► Cloud Run Worker Pool
-            request-serving, IAM-only    on a VM      long-polling Workers,
-            NOT a Serverless Worker                   scaled 0→N by the WCI
+```bash
+make tunnel PROJECT=your-project-id LOCAL_FRONTEND_PORT=7433
+TEMPORAL_ADDRESS=localhost:7433 make web-local
 ```
 
-One image, two entrypoints: the pool runs the Worker, the Service overrides the
-command to run `uvicorn`. There is no database — each run's state lives in Temporal's
-event history, which is the durability argument made structurally rather than claimed.
+The deployed shape is:
 
-Two apps share one Task Queue. `HelloWorkflow` is the infrastructure smoke test and
-needs no Claude key, so you can diagnose scaling without spending tokens.
-`ResearchWorkflow` is the real app.
+| Layer | GCP resource | Behavior |
+|---|---|---|
+| Temporal | Compute Engine VM | Private frontend at `10.10.0.10:7233`; runs the prerelease Worker Controller |
+| Research fleet | Cloud Run Worker Pool | Manual count controlled by Temporal; normally zero when idle |
+| Web tier | Cloud Run Service | Internal ingress and authenticated invocation only |
+| Model key | Secret Manager | Mounted into Workers; never passed through Terraform state |
+| Worker image | Artifact Registry | One image with Worker and web entrypoints |
 
----
+After rebuilding the image with the same tag, force the Worker Pool onto the new digest; Cloud Run pins image digests per revision. See [AGENTS.md](AGENTS.md) gate #14 for the exact command and the other deployment invariants.
+
+## How the Workflow runs
+
+```text
+plan → fan out research → synthesize → wait for review → accept or refine
+```
+
+- `HelloWorkflow` is the token-free infrastructure smoke test. Its five-second Activity creates the backlog used to verify scaling.
+- `ResearchWorkflow` is the real application. It plans, fans out, synthesizes, pauses for review, and optionally performs one refinement round.
+- `runtime.py` is app-agnostic infrastructure. Both applications plug into its versioned Worker seam.
+- `llm.py` is the Gemini seam. Temporal is the only retry layer; Google Search is a built-in server tool.
 
 ## Configuration
 
-Locally you can skip all of it — the defaults target `temporal server start-dev`.
+Local defaults target `temporal server start-dev`.
 
-| Variable | Default | Notes |
+| Variable | Default | Purpose |
 |---|---|---|
-| `TEMPORAL_ADDRESS` | `localhost:7233` | `<ns>.<acct>.tmprl.cloud:7233` for Cloud |
-| `TEMPORAL_API_KEY` | *unset* | Temporal Cloud; setting it turns TLS on |
-| `TEMPORAL_DEPLOYMENT_NAME` | `research-fleet` | A mismatch makes Workflows hang with **no error** |
-| `MAX_CONCURRENT_ACTIVITIES` | `1` | Activity slots per Worker. Raising it hides the scaling behaviour |
-| `MAX_SUBQUESTIONS` | `6` | Fan-out width — this *is* the worker count one question lights up |
-| `RESEARCH_EFFORT` | `medium` | The biggest lever on how long the room waits |
-| `ANTHROPIC_API_KEY` | *unset* | Research app only; from Secret Manager in production |
-| `DEMO_PASSCODE` | *unset* | Web tier. Guards both asking and approving — each spends tokens |
+| `TEMPORAL_ADDRESS` | `localhost:7233` | Temporal frontend address |
+| `TEMPORAL_API_KEY` | unset | Temporal Cloud credential; setting it enables TLS |
+| `TEMPORAL_DEPLOYMENT_NAME` | `research-fleet` | Versioned Worker Deployment name |
+| `MAX_CONCURRENT_ACTIVITIES` | `1` | Activity slots per Worker; raising this hides deployed scaling |
+| `MAX_SUBQUESTIONS` | `6` | Fan-out width and approximate Worker count per question |
+| `RESEARCH_EFFORT` | `medium` | Gemini thinking level: `minimal`, `low`, `medium`, or `high` |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | Model selected without rebuilding the image |
+| `GEMINI_API_KEY` | unset | Required only when a research Activity first calls Gemini |
+| `DEMO_PASSCODE` | unset | Guards both asking and refinement actions in the web tier |
 
-Full list with reasoning lives in `runtime.py` and `research_activities.py`.
+## Test it
 
----
+```bash
+make test
+```
 
-## Repo map
+The suite is offline: **105 Python tests + 10 Terraform contract tests**. Gemini calls use fakes and never spend tokens.
 
-| | |
+For the live infrastructure gate:
+
+```bash
+make verify SCALE=1 PROJECT=your-project-id
+```
+
+## Repository map
+
+| Path | Role |
 |---|---|
-| `runtime.py` | The infra half — connect, versioned Worker, slot limits, SIGTERM drain. App-agnostic |
-| `workflows.py` · `activities.py` | The hello app: the infrastructure smoke test |
-| `llm.py` | The Claude seam. Imports no `temporalio`; `max_retries=0` because Temporal owns retry |
-| `research_*.py` | Plan → fan out → draft → human review → optional second pass |
-| `web.py` · `web/` | The single-page console. Vanilla JS, no build step |
-| `terraform/` | The whole GCP stack, one `make up` |
-| `tests/` · `learn/` · `docs/` | 113 offline tests · eleven in-app learn cards · tutorial and knowledge base |
+| `runtime.py` | Connection, versioned Worker, slot limits, unique identity, graceful shutdown |
+| `workflows.py` · `activities.py` | Token-free infrastructure smoke test |
+| `llm.py` | Gemini + Google Search boundary, isolated from Temporal |
+| `research_*.py` | Plan, parallel research, synthesis, review, and transport types |
+| `web.py` · `web/` | Responsive workbench; FastAPI and vanilla JS, no build step |
+| `terraform/` | Complete private GCP stack |
+| `tests/` | Workflow, replay, web-security, provider, and infrastructure contracts |
+| `learn/` · `docs/` | In-app learning cards, runnable tutorial, and research knowledge base |
 
----
+For the manual walkthrough, see [docs/TUTORIAL.md](docs/TUTORIAL.md). For the platform research and design rationale, see [docs/KNOWLEDGE_BASE.md](docs/KNOWLEDGE_BASE.md).
 
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). Copyright 2026 Temporal Technologies, Inc.
 
-Bundled fonts are redistributed under the SIL Open Font License
-(`web/fonts/LICENSE-*.txt`). The Temporal wordmark in `web/temporal-logo.svg` is a
-trademark of Temporal Technologies, included for use in this demo and not covered by
-Apache-2.0.
+Bundled fonts are redistributed under the SIL Open Font License (`web/fonts/LICENSE-*.txt`). The Temporal wordmark in `web/temporal-logo.svg` is a trademark of Temporal Technologies, included for this demo and not covered by Apache-2.0.
+
+---
+
+This Gemini edition is a provider port of the original [Durable Research Fleet](https://github.com/temporal-community/durable-research-fleet), created by [Shubham Londhe (@LondheShubham153)](https://github.com/LondheShubham153).

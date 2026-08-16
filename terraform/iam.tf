@@ -23,8 +23,8 @@ resource "google_service_account" "worker_rt" {
   depends_on   = [google_project_service.apis]
 }
 
-# The docs ask for "run.developer or equivalent (must include run.workerPools.get and
-# run.workerPools.update)". We grant the equivalent rather than the predefined role:
+# The docs ask for "run.developer or equivalent (must include run.workerpools.get and
+# run.workerpools.update)". We grant the equivalent rather than the predefined role:
 # project-level roles/run.developer also lets the invoker create, update and DELETE
 # every other Cloud Run resource in this project — including the public web Service.
 # The invoker is the identity Temporal impersonates, so keep it to the two verbs the
@@ -38,8 +38,8 @@ resource "google_project_iam_custom_role" "worker_pool_scaler" {
   title       = "Serverless Workers — Worker Pool scaler"
   description = "Minimum for the Temporal invoker SA to read and resize a Cloud Run Worker Pool."
   permissions = [
-    "run.workerPools.get",
-    "run.workerPools.update",
+    "run.workerpools.get",
+    "run.workerpools.update",
   ]
 }
 

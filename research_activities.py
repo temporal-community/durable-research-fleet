@@ -4,15 +4,12 @@
     research_subquestion one call + server-side web search   1-5 min   <- fans out
     synthesize           one call over the collected findings   ~1 min
 
-Those durations are MEASURED, and they are why the timeouts look generous: server-side
-web search fetches and filters pages inside one HTTP request. A 120s ceiling produced
-four consecutive APITimeoutErrors on the first live run.
-
-The heartbeat runs on a TIMER, not between `pause_turn` rounds. One round can exceed
-`heartbeat_timeout`, and the server cannot tell "still thinking" from "instance scaled
-away" — so a healthy Activity got timed out and retried, burning tokens already spent.
-The timer also means the last heartbeat holds partial research for the retry to
-continue from.
+Those durations are measured from the original implementation, and they are why the
+timeouts remain generous: Google Search grounding happens inside one long Gemini API
+request. The heartbeat runs on a timer while that request is in flight, so the server
+can distinguish "still working" from "instance scaled away". GenerateContent returns
+atomically; a killed in-flight call is retried from the beginning, while completed
+sibling findings remain durable in Workflow history.
 """
 
 from __future__ import annotations
@@ -48,10 +45,6 @@ HEARTBEAT_INTERVAL_SECONDS = 15.0
 MAX_SUBQUESTIONS = max(1, int(os.environ.get("MAX_SUBQUESTIONS", "6")))
 MIN_SUBQUESTIONS = min(3, MAX_SUBQUESTIONS)
 
-# Cap on the partial text carried in a heartbeat. Heartbeat details ride every
-# heartbeat, so this is not a place to park an unbounded string.
-CHECKPOINT_SUMMARY_CHARS = 4_000
-
 # How many sources the final answer carries. A measured run consulted 436 unique
 # pages; showing them all buries the answer on a phone screen.
 MAX_SOURCES_SHOWN = 25
@@ -70,15 +63,10 @@ SYNTHESIS_EFFORT = os.environ.get("SYNTHESIS_EFFORT", "high").strip()
 # Prompts
 # --------------------------------------------------------------------------
 
-# Byte-identical across every sub-question in a burst so the rest read it from cache
-# at ~0.1x input price — the biggest cost lever here. Never interpolate into it.
-# LENGTH IS FUNCTIONAL: Opus 5 silently stops caching a prefix under 512 tokens
-# (cache_creation_input_tokens just stays 0). Guarded by
-# `test_research_prompt_is_cacheable`. Do not trim for tidiness.
-SYSTEM_RESEARCH = [
-    {
-        "type": "text",
-        "text": """You are a research analyst working on one narrow sub-question that forms part of a larger investigation. Another analyst will combine your answer with several others, so your job is depth on your specific sub-question rather than breadth across the whole topic. Do not try to answer the broader question you can infer around it.
+# Byte-identical across every sub-question in a burst. Gemini implicit caching is
+# automatic for supported requests and benefits from a common prefix, but no manual
+# provider-specific cache marker belongs in the prompt. Never interpolate into it.
+SYSTEM_RESEARCH = """You are a research analyst working on one narrow sub-question that forms part of a larger investigation. Another analyst will combine your answer with several others, so your job is depth on your specific sub-question rather than breadth across the whole topic. Do not try to answer the broader question you can infer around it.
 
 Method:
 - Search the web before you answer. Do not answer from memory, even when you are confident: your training data may be stale, and the entire point of this task is current information.
@@ -99,11 +87,7 @@ Output:
 - Lead with the answer to the sub-question in your first sentence. Supporting evidence, figures and caveats come after it.
 - Attach concrete specifics wherever you have them: numbers, dates, named organisations, named places. Vague summary is the failure mode to avoid.
 - Do not pad to reach the word count. If the honest answer is short, keep it short.
-- Never invent a statistic, a quotation, a date, or a source. If you did not find it, say you did not find it.""",
-        # Cache the prefix. See the comment above.
-        "cache_control": {"type": "ephemeral"},
-    }
-]
+- Never invent a statistic, a quotation, a date, or a source. If you did not find it, say you did not find it."""
 
 SYSTEM_PLAN = """You break a research question into independent sub-questions that can be investigated in parallel.
 
@@ -172,27 +156,6 @@ async def _heartbeating(state: Checkpoint, interval: float | None = None):
             await task
 
 
-def _resume_from() -> Checkpoint | None:
-    """The checkpoint from a previous attempt, if this is a retry.
-
-    Heartbeat details come back without type information, so a dataclass arrives
-    as a plain dict — handle both rather than assuming.
-    """
-    details = activity.info().heartbeat_details
-    if not details:
-        return None
-    raw = details[-1]
-    if isinstance(raw, Checkpoint):
-        return raw
-    if isinstance(raw, dict):
-        return Checkpoint(
-            rounds_done=raw.get("rounds_done", 0) or 0,
-            partial_summary=raw.get("partial_summary", "") or "",
-            tokens_so_far=raw.get("tokens_so_far", 0) or 0,
-        )
-    return None
-
-
 # --------------------------------------------------------------------------
 # Activities
 # --------------------------------------------------------------------------
@@ -203,7 +166,7 @@ async def plan_research(question: str) -> ResearchPlan:
     """Split the question into independent, parallel-researchable sub-questions.
 
     Returns the plan AND its usage. Returning a bare list dropped the planning
-    spend — one Opus 5 call per question, missing from the cost counter.
+    spend — one model call per question, missing from the token counter.
     """
     schema: dict[str, Any] = {
         "type": "object",
@@ -250,52 +213,13 @@ async def plan_research(question: str) -> ResearchPlan:
 
 @activity.defn
 async def research_subquestion(sub: SubQuestion) -> Finding:
-    """Research one sub-question with server-side web search.
+    """Research one sub-question with Google Search grounding.
 
     The fan-out unit: N of these hit the Task Queue at once, N-1 fail to sync-match
     against the current pool, and the Worker Controller scales up to meet them.
     """
-    resume = _resume_from()
-    state = Checkpoint(
-        rounds_done=resume.rounds_done if resume else 0,
-        partial_summary=resume.partial_summary if resume else "",
-        tokens_so_far=resume.tokens_so_far if resume else 0,
-    )
-
+    state = Checkpoint()
     prompt = f"Sub-question:\n\n{sub.text}"
-    if resume and resume.partial_summary:
-        # A previous attempt was interrupted — almost certainly by pool-level
-        # scale-in. Hand back what it had already established so this attempt
-        # extends it instead of re-running the same searches.
-        activity.logger.info(
-            "resuming sub-question %d from checkpoint (%d rounds, %d tokens already spent)",
-            sub.index,
-            resume.rounds_done,
-            resume.tokens_so_far,
-        )
-        prompt += (
-            "\n\nA previous attempt at this sub-question was interrupted before it "
-            "finished. Here is what it had already established:\n\n"
-            f"{resume.partial_summary}\n\n"
-            "Continue from there. Verify anything that looks shaky, fill the gaps, "
-            "and return the complete answer — but do not repeat searches whose "
-            "results are already reflected above."
-        )
-
-    def checkpoint(partial: llm.LLMResult) -> None:
-        """Record a completed research round so a retry can continue from it.
-
-        Called at each `pause_turn` boundary. Writing the actual partial text here
-        — not just a round counter — is what makes `resumed` meaningful and what
-        the durability credit is computed from.
-
-        Bounded, because heartbeat details ride every heartbeat and this is not a
-        place to park an unbounded string.
-        """
-        state.rounds_done = partial.rounds
-        state.partial_summary = partial.text.strip()[:CHECKPOINT_SUMMARY_CHARS]
-        state.tokens_so_far = partial.usage.total_tokens
-        activity.heartbeat(state)
 
     try:
         async with _heartbeating(state):
@@ -305,15 +229,15 @@ async def research_subquestion(sub: SubQuestion) -> Finding:
                 tools=[llm.WEB_SEARCH_TOOL],
                 max_tokens=16_000,
                 effort=RESEARCH_EFFORT,
-                on_progress=checkpoint,
             )
     except asyncio.CancelledError:
-        # Graceful shutdown during scale-in cancels in-flight Activities. Record
-        # the freshest checkpoint on the way out so the retry — which will land on
-        # a different instance — starts from here rather than from nothing.
+        # Graceful shutdown during scale-in cancels in-flight Activities. Emit one
+        # final heartbeat so Temporal detects the lost attempt promptly. Gemini's
+        # atomic response has no partial text to carry across the retry.
         activity.heartbeat(state)
         activity.logger.warning(
-            "sub-question %d cancelled mid-flight; checkpoint recorded", sub.index
+            "sub-question %d cancelled mid-flight; retry will restart the call",
+            sub.index,
         )
         raise
 
@@ -326,7 +250,7 @@ async def research_subquestion(sub: SubQuestion) -> Finding:
         rounds=result.rounds,
         # The interruption signal the footer actually keys on — see Finding.attempt.
         attempt=activity.info().attempt,
-        resumed=bool(resume and resume.partial_summary),
+        resumed=False,
     )
 
 

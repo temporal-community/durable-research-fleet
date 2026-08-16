@@ -27,7 +27,7 @@ output "worker_image" {
 # the front of the room. There is deliberately no `dashboard_url` output any more.
 #
 # NOT hand-out-able since 2026-07-31. The Service is internal-ingress with invoker IAM
-# on (CLAUDE.md gate #12), so this URL 403s for anyone not named in
+# on (AGENTS.md gate #12), so this URL 403s for anyone not named in
 # `var.web_invoker_users`. Kept because it is still how you identify the revision and
 # tail its logs. To actually serve the console, run `make web-local` against this
 # project's Temporal over the SSH tunnel.
@@ -36,11 +36,11 @@ output "web_service_url" {
   value       = google_cloud_run_v2_service.web.uri
 }
 
-output "set_anthropic_key" {
-  description = "Populate the Claude key without putting it in Terraform state"
+output "set_gemini_key" {
+  description = "Populate the Gemini key without putting it in Terraform state"
   value = join(" ", [
-    "printf %s \"$ANTHROPIC_API_KEY\" | gcloud secrets versions add",
-    google_secret_manager_secret.anthropic.secret_id,
+    "printf %s \"$GEMINI_API_KEY\" | gcloud secrets versions add",
+    google_secret_manager_secret.gemini.secret_id,
     "--data-file=- --project ${var.project_id}",
   ])
 }

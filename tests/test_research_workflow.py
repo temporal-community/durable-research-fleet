@@ -62,9 +62,8 @@ def _mocks(*, n_subs=3, resumed=(), retried=(), plan_texts=None):
             summary=f"found {sub.index}",
             usage=Usage(input_tokens=100, output_tokens=100),
             # attempt>1 is what a real interruption looks like: Temporal re-ran the
-            # Activity. `resumed` additionally requires a heartbeat to have carried
-            # partial work, which needs a pause_turn boundary — measured never to
-            # happen, so the credit cannot key on it.
+            # Activity. Gemini's grounded request is atomic, so `resumed` remains
+            # false and the durability credit cannot key on it.
             attempt=2 if sub.index in retried else 1,
             resumed=sub.index in resumed,
         )
@@ -477,11 +476,8 @@ async def test_credit_fires_on_a_RETRY_not_only_on_a_resume(
 ):
     """REGRESSION, and the most consequential one in this suite.
 
-    The credit originally keyed on `resumed`, which requires a heartbeat to have
-    carried partial work — which requires the Claude call to cross a `pause_turn`
-    boundary. A real measured run showed `rounds=1` on all six sub-questions: the
-    server-side search loop finishes inside ONE request, so `pause_turn` never
-    happens and `resumed` is never true.
+    The credit originally keyed on `resumed`, but Gemini's server-side search
+    grounding finishes atomically inside one request, so `resumed` is never true.
 
     The consequence was severe and silent: the durability counter would have read 0
     all the way through the one demo moment it exists for. Keying on Temporal's

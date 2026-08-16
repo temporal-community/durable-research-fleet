@@ -79,8 +79,9 @@ gcloud iam service-accounts get-iam-policy "$INVOKER" --project "$PROJECT" --for
 
 gcloud projects get-iam-policy "$PROJECT" --flatten='bindings[].members' \
   --filter="bindings.members:$INVOKER" --format='value(bindings.role)' 2>/dev/null \
-  | grep -q 'roles/run.developer' \
-  && ok "invoker has run.developer" || bad "invoker missing run.developer"
+  | grep -Fxq "projects/$PROJECT/roles/workerPoolScaler" \
+  && ok "invoker has least-privilege Worker Pool scaler role" \
+  || bad "invoker missing projects/$PROJECT/roles/workerPoolScaler"
 
 gcloud services list --enabled --project "$PROJECT" 2>/dev/null | grep -q iamcredentials \
   && ok "iamcredentials API enabled" || bad "iamcredentials API disabled (getAccessToken will fail)"

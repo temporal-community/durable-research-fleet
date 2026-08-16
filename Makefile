@@ -14,11 +14,11 @@
 #
 # After `make up`, get the URLs and the two commands you'll want on stage:
 #   terraform -chdir=terraform output web_service_url  # internal-ingress; NOT a public link
-#   terraform -chdir=terraform output set_anthropic_key
+#   terraform -chdir=terraform output set_gemini_key
 #   terraform -chdir=terraform output chaos
 #
 # The console itself is served by `make web-local` over the SSH tunnel — the Cloud Run
-# Service is not internet-reachable on purpose (CLAUDE.md gate #12).
+# Service is not internet-reachable on purpose (AGENTS.md gate #12).
 
 # SET THIS. The default is the project this demo was built in, and you almost
 # certainly cannot deploy into it:
@@ -31,6 +31,13 @@ BUILD_ID ?= v1
 # Kept as its own variable rather than derived from PREFIX: the infra identifiers say
 # research-fleet/research-queue and renaming them forces resource recreation for no gain.
 TASK_QUEUE ?= research-queue
+GEMINI_MODEL ?= gemini-3.6-flash
+
+# CLI main currently pins a July auto-scaled-workers revision whose GCP provider
+# sends the camelCase field mask scaling.manualInstanceCount over gRPC. Cloud Run
+# accepts that request but silently leaves the instance count unchanged. This
+# upstream revision carries the snake_case field-mask fix and its regression test.
+AUTO_SCALED_WORKERS_VERSION ?= v0.0.0-20260811170210-91f6fe1d10ab
 
 # Local ports for the SSH tunnels. Defaults match Temporal's conventions so
 # starter.py works with no env vars — but override them if something else is
@@ -59,7 +66,8 @@ TF_VARS := \
   -var="name_prefix=$(PREFIX)" \
   -var="deployment_name=$(PREFIX)" \
   -var="task_queue=$(TASK_QUEUE)" \
-  -var="build_id=$(BUILD_ID)"
+  -var="build_id=$(BUILD_ID)" \
+  -var="gemini_model=$(GEMINI_MODEL)"
 
 # Fail fast rather than half-deploying on a mismatch.
 #
@@ -116,6 +124,7 @@ bin/temporal-linux:
 	@echo "==> building temporal CLI from main (the Cloud Run provider is not in any release)"
 	@mkdir -p bin
 	@rm -rf /tmp/bb-cli && git clone --depth 1 https://github.com/temporalio/cli.git /tmp/bb-cli
+	cd /tmp/bb-cli && go get go.temporal.io/auto-scaled-workers@$(AUTO_SCALED_WORKERS_VERSION)
 	cd /tmp/bb-cli && GOOS=linux GOARCH=amd64 go build -o $(CURDIR)/bin/temporal-linux ./cmd/temporal
 	@echo "==> $$($(CURDIR)/bin/temporal-linux --version 2>/dev/null || echo built)"
 
@@ -131,12 +140,12 @@ image: ## Build linux/amd64 image and push
 	docker build --platform linux/amd64 -t $(IMAGE) .
 	docker push $(IMAGE)
 
-# The pool mounts ANTHROPIC_API_KEY as a secret_key_ref pinned to version "latest",
+# The pool mounts GEMINI_API_KEY as a secret_key_ref pinned to version "latest",
 # and Cloud Run resolves that AT POOL CREATE TIME. If the secret has no versions it
 # refuses to create the pool at all:
 #
 #   Error code 9: spec.template.spec.containers[0].env[8].value_from.secret_key_ref
-#   .name: Secret .../secrets/research-fleet-anthropic-api-key/versions/latest was not found
+#   .name: Secret .../secrets/research-fleet-gemini-api-key/versions/latest was not found
 #
 # So the secret must exist AND hold a version before the main apply. Found on the
 # first real deploy, 2026-07-29 — `make up` could never have worked from scratch,
@@ -146,27 +155,27 @@ image: ## Build linux/amd64 image and push
 # Same idiom as `repo` above: one -target apply to break a create-time ordering
 # cycle a single apply cannot express. Idempotent — it never clobbers an existing
 # version, because doing so would repoint "latest" at a placeholder on a live stack.
-secret: check-config ## Create the Anthropic secret and seed a version (must precede the pool)
+secret: check-config ## Create the Gemini secret and seed a version (must precede the pool)
 	$(TF) init -upgrade
-	$(TF) apply -target=google_secret_manager_secret.anthropic $(TF_VARS) -auto-approve
-	@if gcloud secrets versions list $(PREFIX)-anthropic-api-key --project=$(PROJECT) \
+	$(TF) apply -target=google_secret_manager_secret.gemini $(TF_VARS) -auto-approve
+	@if gcloud secrets versions list $(PREFIX)-gemini-api-key --project=$(PROJECT) \
 	      --filter='state=enabled' --format='value(name)' 2>/dev/null | grep -q .; then \
 	  echo "==> secret already holds an enabled version; leaving it untouched"; \
-	elif [ -n "$$ANTHROPIC_API_KEY" ]; then \
-	  printf %s "$$ANTHROPIC_API_KEY" | gcloud secrets versions add \
-	    $(PREFIX)-anthropic-api-key --data-file=- --project=$(PROJECT) >/dev/null; \
-	  echo "==> stored ANTHROPIC_API_KEY (never passed through Terraform)"; \
+	elif [ -n "$$GEMINI_API_KEY" ]; then \
+	  printf %s "$$GEMINI_API_KEY" | gcloud secrets versions add \
+	    $(PREFIX)-gemini-api-key --data-file=- --project=$(PROJECT) >/dev/null; \
+	  echo "==> stored GEMINI_API_KEY (never passed through Terraform)"; \
 	else \
 	  printf %s unset | gcloud secrets versions add \
-	    $(PREFIX)-anthropic-api-key --data-file=- --project=$(PROJECT) >/dev/null; \
-	  echo "==> WARNING: ANTHROPIC_API_KEY unset — seeded a placeholder so the pool can"; \
+	    $(PREFIX)-gemini-api-key --data-file=- --project=$(PROJECT) >/dev/null; \
+	  echo "==> WARNING: GEMINI_API_KEY unset — seeded a placeholder so the pool can"; \
 	  echo "    be created. The hello app and 'make verify SCALE=1' work as documented;"; \
 	  echo "    research Activities will fail until you run:"; \
 	  echo "      make -s print-set-key"; \
 	fi
 
-print-set-key: ## Print the command that stores a real Anthropic key
-	@$(TF) output -raw set_anthropic_key; echo ""
+print-set-key: ## Print the command that stores a real Gemini key
+	@$(TF) output -raw set_gemini_key; echo ""
 
 plan: check-config ## Show the plan
 	$(TF) init -upgrade
@@ -210,7 +219,7 @@ register-queues: ## One-time after first apply: let the pool poll once so Task Q
 # is the point: get the agent right before the namespace gate matters.
 #
 #   1. temporal server start-dev
-#   2. export ANTHROPIC_API_KEY=sk-ant-...   (or put it in .env, which is gitignored)
+#   2. export GEMINI_API_KEY=...          (or put it in .env, which is gitignored)
 #   3. MAX_CONCURRENT_ACTIVITIES=6 .venv/bin/python worker_local.py
 #   4. temporal worker deployment set-current-version \
 #        --deployment-name research-fleet --build-id local --yes

@@ -4,8 +4,8 @@ Runs on a Cloud Run **Service**, not a Worker Pool: it is a Temporal *client* th
 starts Workflows, reads Queries and sends Signals. Same image as the Worker, with
 the command overridden to uvicorn.
 
-MUST NOT import `research_workflow`, `llm` or `anthropic`. Workflows are started,
-queried and signalled by NAME STRING so the web process needs no Claude key.
+MUST NOT import `research_workflow`, `llm` or `google.genai`. Workflows are started,
+queried and signalled by NAME STRING so the web process needs no Gemini key.
 Enforced by tests/test_serverless_contract.py.
 
 The Serverless Workers count is `DescribeTaskQueue` poller identities — one Worker
@@ -221,7 +221,7 @@ async def decide(workflow_id: str, request: Request) -> dict:
 
     Guarded exactly like `/api/ask`, because it spends exactly like `/api/ask`: a
     `refine` decision starts a SECOND fan-out. Without these two checks, knowing a run
-    id was enough to spend Claude tokens repeatedly, bypassing both the passcode and
+    id was enough to spend Gemini tokens repeatedly, bypassing both the passcode and
     the per-IP limit. Run ids are `research-<uuid4[:10]>` and there is no listing
     endpoint, so they are not enumerable — but they are on screen in front of a room.
     """

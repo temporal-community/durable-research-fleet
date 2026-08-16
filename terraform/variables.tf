@@ -139,7 +139,7 @@ variable "worker_cpu" {
 }
 
 variable "worker_memory" {
-  description = "1Gi rather than 512Mi: the image now carries the Anthropic SDK and the research Activities hold whole web pages in memory while Claude filters them. The hello app fits in far less."
+  description = "1Gi rather than 512Mi: the image carries the Google Gen AI SDK and research Activities can hold large grounded responses in memory. The hello app fits in far less."
   type        = string
   default     = "1Gi"
 }
@@ -148,16 +148,16 @@ variable "worker_memory" {
 # Research app
 # ---------------------------------------------------------------------------
 
-variable "anthropic_api_key" {
+variable "gemini_api_key" {
   description = <<-EOT
-    Claude API key for the research app. Leave null (the default) and populate the
+    Gemini Developer API key for the research app. Leave null (the default) and populate the
     secret out of band instead, which keeps the key out of Terraform state:
 
-      printf %s "$ANTHROPIC_API_KEY" | gcloud secrets versions add \
-        research-fleet-anthropic-api-key --data-file=- --project <project>
+      printf %s "$GEMINI_API_KEY" | gcloud secrets versions add \
+        research-fleet-gemini-api-key --data-file=- --project <project>
 
     Setting it here works but writes the key into terraform.tfstate in the clear.
-    Only the Worker Pool reads it; the web tier never calls Claude.
+    Only the Worker Pool reads it; the web tier never calls Gemini.
   EOT
   type        = string
   default     = null
@@ -199,7 +199,18 @@ variable "max_subquestions" {
 }
 
 variable "research_effort" {
-  description = "Claude effort for the research call: the demo's latency knob. `low` is fast enough to hold a room, `high` researches harder and makes them wait."
+  description = "Gemini thinking level for research calls: minimal, low, medium, or high. This is the demo's latency knob."
   type        = string
   default     = "medium"
+
+  validation {
+    condition     = contains(["minimal", "low", "medium", "high"], var.research_effort)
+    error_message = "research_effort must be one of: minimal, low, medium, high."
+  }
+}
+
+variable "gemini_model" {
+  description = "Gemini model ID used by the research app. The default is the GA Gemini 3.6 Flash model."
+  type        = string
+  default     = "gemini-3.6-flash"
 }

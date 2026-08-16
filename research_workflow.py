@@ -35,7 +35,7 @@ with workflow.unsafe.imports_passed_through():
     from research_types import Answer, Finding, ResearchPlan, SubQuestion
 
 # Invariant: HEARTBEAT_INTERVAL (15s) < HEARTBEAT_TIMEOUT < START_TO_CLOSE.
-# 1200s because `llm.complete` makes up to 3 rounds x 300s = 900s for ONE Activity.
+# 1200s leaves headroom around one Gemini request with a 300s HTTP ceiling.
 # heartbeat_timeout stays 60s regardless — that is the point of heartbeating on a
 # timer: liveness is decoupled from call duration.
 RESEARCH_START_TO_CLOSE_SECONDS = 1200
@@ -54,8 +54,8 @@ REVIEW_TIMEOUT_SECONDS = 2 * 60 * 60
 # spend ceiling for a single question as well as a complexity ceiling.
 MAX_REVIEW_ROUNDS = 1
 
-# Slower than the hello app's on purpose: ~120 concurrent Opus 5 calls means 429s are
-# expected, and Temporal is the ONLY retry layer, so this must ride one out alone.
+# Slower than the hello app's on purpose: a room can create many concurrent Gemini
+# calls, so 429s are expected. Temporal is the only retry layer.
 RESEARCH_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
     backoff_coefficient=2.0,
@@ -207,7 +207,7 @@ class ResearchWorkflow:
             heartbeat_timeout=timedelta(seconds=SHORT_HEARTBEAT_TIMEOUT_SECONDS),
             retry_policy=RESEARCH_RETRY,
         )
-        # Planning is a real Opus 5 call and has to be counted. Dropping it made the
+        # Planning is a real Gemini call and has to be counted. Dropping it made the
         # dashboard read zero tokens for a question that had already done work.
         self._s.usage = self._s.usage + plan.usage
         self._banked += plan.usage.total_tokens
@@ -280,11 +280,10 @@ class ResearchWorkflow:
         and paid for all of it again. That difference is the number worth putting on
         a screen, and it is measured rather than modelled.
 
-        KEYED ON `attempt`, NOT `resumed`. `resumed` requires a heartbeat to have
-        carried partial work, which requires the Claude call to have crossed a
-        `pause_turn` boundary — and measurement shows that does not happen: every
-        real sub-question completes in one round. Keying the credit on `resumed`
-        meant the counter sat at 0 through the exact demo moment it exists for.
+        KEYED ON `attempt`, NOT `resumed`. Gemini's grounded GenerateContent request
+        is atomic, so an interrupted in-flight call restarts and `resumed` remains
+        false. Keying the credit on `resumed` would leave the counter at 0 through
+        the exact demo moment it exists for.
         """
         self._s.findings.append(finding)
         self._s.usage = self._s.usage + finding.usage

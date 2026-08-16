@@ -1,19 +1,16 @@
-"""The Claude seam. Everything that knows about the Anthropic API lives here.
+"""The Gemini seam. Everything that knows about the Google Gen AI SDK lives here.
 
-MUST NOT import `temporalio` — that keeps it unit-testable without a server and keeps
-the retry story in one place. Progress is reported via an injected `on_progress`
-callback, which the Activity wires to `activity.heartbeat`.
+MUST NOT import ``temporalio`` — that keeps it unit-testable without a server and
+keeps retry ownership in one place. Three details are load-bearing:
 
-Three load-bearing facts:
-
-1. Web search is a SERVER-side tool. `web_search_20260209` runs on Anthropic's
-   infrastructure, so researching a question is ONE API call, not a client-side tool
-   loop. No scraper, no search API key.
-2. `max_retries=0`. Temporal is the only retry layer; two backoff loops multiply into
-   latency nobody can reason about.
-3. `pause_turn` is the checkpoint boundary — a server-tool loop that hits its
-   iteration cap returns it instead of finishing, and each boundary is where we
-   heartbeat so a scale-in kill resumes from the last completed round.
+1. Google Search grounding is a server-side tool. Research remains one Gemini API
+   request, not a client-side search or scraping loop.
+2. The SDK is configured for one HTTP attempt. Temporal's Activity RetryPolicy is
+   the only retry layer, so independent backoff loops cannot multiply.
+3. A grounded GenerateContent call returns atomically. There is no partial-response
+   boundary at which model output can be checkpointed; timer heartbeats provide
+   liveness while completed sibling
+   Activities remain durable in Workflow history.
 """
 
 from __future__ import annotations
@@ -21,60 +18,46 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
-import anthropic
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger("llm")
 
-# --------------------------------------------------------------------------
-# Model and pricing
-# --------------------------------------------------------------------------
+# Stable GA model as of 2026-07-21. Keep the environment override so a model
+# migration does not require rebuilding the Worker image.
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip()
 
-MODEL = "claude-opus-5"
+# Gemini performs the search, retrieval and grounding on Google's servers. There
+# is no local tool loop and no separate search API key.
+WEB_SEARCH_TOOL = types.Tool(google_search=types.GoogleSearch())
 
-# Server-side web search. `_20260209` is the variant documented as supported on
-# Opus 5 and carries dynamic filtering (Claude writes code to filter results
-# before they reach the context window), so we must NOT also declare
-# code_execution — a second execution environment confuses the model.
-# A newer `web_search_20260318` exists in the SDK; untested on this path.
-WEB_SEARCH_TOOL: dict[str, str] = {"type": "web_search_20260209", "name": "web_search"}
+# One grounded request can legitimately take minutes. This is a per-request
+# ceiling and must remain below the Activity's start_to_close timeout.
+HTTP_TIMEOUT_SECONDS = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "300"))
 
-# No pricing table, deliberately: a hardcoded rate card goes stale silently and the
-# only symptom is a wrong number on a projector. Tokens and searches are the units.
-
-# A safety classifier declining on stage would end the demo, so a refusal is re-run
-# on the recommended fallback inside the same call. "default" lets it route by
-# refusal category. Kill switch: CLAUDE_FALLBACKS=false
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
-FALLBACKS_ENABLED = os.environ.get("CLAUDE_FALLBACKS", "true").strip().lower() == "true"
-
-# Per-ROUND, not per Activity: `complete()` makes up to MAX_PAUSE_RESUMES + 1 calls.
-# The BUDGET MUST CLOSE — rounds x this must stay under the Activity's
-# start_to_close, or a slow-but-healthy call is killed by the Activity timeout
-# instead of surfacing as retryable. 120s here caused four live timeouts.
-# Guarded by test_the_timeout_budget_closes.
-HTTP_TIMEOUT_SECONDS = float(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300"))
-
-# Low on purpose so the worst case fits the budget above: 3 x 300s < 1200s.
-MAX_PAUSE_RESUMES = 2
+_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
+_NON_RETRYABLE_FINISH_REASONS = {
+    "SAFETY",
+    "RECITATION",
+    "BLOCKLIST",
+    "PROHIBITED_CONTENT",
+    "SPII",
+}
 
 
 class RefusalError(Exception):
-    """Claude declined and no fallback accepted it.
+    """Gemini blocked the prompt or response.
 
-    NOT retryable: an identical refused request is declined again and burns tokens.
+    This is non-retryable because an identical request is expected to be blocked
+    again and would only consume another Activity attempt.
     """
-
-
-# --------------------------------------------------------------------------
-# Usage accounting — tokens, cache reads and searches. No money.
-# --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Usage:
-    """Token spend for one or more calls. Plain dataclass so Temporal carries it."""
+    """Token and search usage for one or more calls. No pricing lives here."""
 
     input_tokens: int = 0
     output_tokens: int = 0
@@ -102,22 +85,40 @@ class Usage:
 
     @classmethod
     def from_response(cls, response: Any) -> "Usage":
-        u = getattr(response, "usage", None)
+        """Map Gemini usage metadata without double-counting cached tokens."""
+        u = getattr(response, "usage_metadata", None)
         if u is None:
             return cls()
-        server = getattr(u, "server_tool_use", None)
+
+        cached = getattr(u, "cached_content_token_count", 0) or 0
+        prompt = getattr(u, "prompt_token_count", 0) or 0
+        tool = getattr(u, "tool_use_prompt_token_count", 0) or 0
+        generated = (
+            getattr(u, "response_token_count", None)
+            or getattr(u, "candidates_token_count", 0)
+            or 0
+        )
+        thoughts = getattr(u, "thoughts_token_count", 0) or 0
+
+        searches = 0
+        for candidate in getattr(response, "candidates", None) or []:
+            grounding = getattr(candidate, "grounding_metadata", None)
+            searches += len(getattr(grounding, "web_search_queries", None) or [])
+
+        # Gemini's prompt count includes cached content. Split that bucket so the
+        # UI can show cache hits without total_tokens counting them twice. Tool
+        # result and thinking tokens are included in the closest existing buckets.
         return cls(
-            input_tokens=getattr(u, "input_tokens", 0) or 0,
-            output_tokens=getattr(u, "output_tokens", 0) or 0,
-            cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
-            cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
-            web_searches=getattr(server, "web_search_requests", 0) or 0 if server else 0,
+            input_tokens=max(0, prompt - cached) + tool,
+            output_tokens=generated + thoughts,
+            cache_read_tokens=cached,
+            web_searches=searches,
         )
 
 
 @dataclass(frozen=True)
 class Source:
-    """One page Claude actually consulted, for citation in the final answer."""
+    """One web page Gemini used to ground its response."""
 
     url: str
     title: str = ""
@@ -128,168 +129,120 @@ class LLMResult:
     text: str = ""
     sources: list[Source] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
-    # How many pause_turn boundaries this call crossed. Recorded so a resumed
-    # Activity can report how much work it kept rather than redid.
+    # Retained in the transport shape used by the UI. GenerateContent is one
+    # atomic round, so Gemini results always report 1.
     rounds: int = 1
 
 
-# --------------------------------------------------------------------------
-# Client
-# --------------------------------------------------------------------------
-
-_client: anthropic.AsyncAnthropic | None = None
+_client: genai.Client | None = None
 
 
-def client() -> anthropic.AsyncAnthropic:
-    """Process-wide async client, reused so connections stay warm."""
+def client() -> genai.Client:
+    """Return a process-wide client so HTTP connections stay warm."""
     global _client
     if _client is None:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set. The research app needs it; the hello "
+                "GEMINI_API_KEY is not set. The research app needs it; the hello "
                 "app does not, so `make verify SCALE=1` still works without it."
             )
-        _client = anthropic.AsyncAnthropic(
-            timeout=HTTP_TIMEOUT_SECONDS,
-            # See the module docstring: Temporal owns retry.
-            max_retries=0,
+        _client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=int(HTTP_TIMEOUT_SECONDS * 1000),
+                # One attempt total: Temporal owns retries and backoff.
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         )
     return _client
 
 
-def _extract(response: Any, into: LLMResult) -> None:
-    """Pull text and consulted sources out of one response, appending to `into`."""
-    seen = {s.url for s in into.sources}
-    for block in response.content or []:
-        kind = getattr(block, "type", None)
+def _enum_name(value: Any) -> str:
+    """Normalize SDK enums and test doubles to their wire-level names."""
+    if value is None:
+        return ""
+    raw = getattr(value, "value", value)
+    return str(raw).rsplit(".", 1)[-1].upper()
 
-        if kind == "text":
-            into.text += getattr(block, "text", "") or ""
 
-        elif kind == "web_search_tool_result":
-            content = getattr(block, "content", None)
-            # On success `content` is a LIST of results; on failure it is a single
-            # error object. Branching on that is required, not defensive padding.
-            if not isinstance(content, list):
-                code = getattr(content, "error_code", "unknown")
-                logger.warning("web_search failed: %s", code)
-                continue
-            for result in content:
-                url = getattr(result, "url", None)
-                if url and url not in seen:
-                    seen.add(url)
-                    into.sources.append(
-                        Source(url=url, title=getattr(result, "title", "") or "")
-                    )
+def _blocked_reason(response: Any) -> str | None:
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    prompt_reason = _enum_name(getattr(prompt_feedback, "block_reason", None))
+    if prompt_reason and prompt_reason not in {"BLOCK_REASON_UNSPECIFIED", "NONE"}:
+        return f"prompt:{prompt_reason}"
+
+    for candidate in getattr(response, "candidates", None) or []:
+        finish_reason = _enum_name(getattr(candidate, "finish_reason", None))
+        if finish_reason in _NON_RETRYABLE_FINISH_REASONS:
+            return f"response:{finish_reason}"
+    return None
+
+
+def _extract(response: Any) -> tuple[str, list[Source]]:
+    """Extract visible text and deduplicated grounding sources."""
+    text_parts: list[str] = []
+    sources: list[Source] = []
+    seen: set[str] = set()
+
+    for candidate in getattr(response, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            text = getattr(part, "text", None)
+            if text and not getattr(part, "thought", False):
+                text_parts.append(text)
+
+        grounding = getattr(candidate, "grounding_metadata", None)
+        for chunk in getattr(grounding, "grounding_chunks", None) or []:
+            web = getattr(chunk, "web", None)
+            url = getattr(web, "uri", None)
+            if url and url not in seen:
+                seen.add(url)
+                sources.append(Source(url=url, title=getattr(web, "title", "") or ""))
+
+    return "".join(text_parts), sources
 
 
 async def complete(
     *,
-    system: str | list[dict[str, Any]],
+    system: str,
     prompt: str,
     max_tokens: int = 16_000,
     effort: str = "high",
-    tools: Iterable[dict[str, Any]] | None = None,
+    tools: Iterable[Any] | None = None,
     json_schema: dict[str, Any] | None = None,
-    on_progress: Callable[["LLMResult"], None] | None = None,
 ) -> LLMResult:
-    """One logical Claude turn, resumed across `pause_turn` boundaries.
+    """Run one Gemini GenerateContent request with optional search or JSON schema."""
+    thinking_level = effort.strip().lower()
+    if thinking_level not in _THINKING_LEVELS:
+        allowed = ", ".join(sorted(_THINKING_LEVELS))
+        raise ValueError(f"unsupported Gemini thinking level {effort!r}; choose {allowed}")
 
-    `json_schema` constrains the reply to that shape, so the planner shares this
-    one code path (fallbacks, refusal handling, usage accounting) instead of
-    having its own. Note it cannot be combined with citations, which is fine
-    because the schema path never passes tools.
-
-    `on_progress(partial)` is called at each `pause_turn` boundary with the
-    accumulated result so far — text, sources, usage and round count.
-
-    It receives the whole partial rather than just a round number, and that
-    matters: the caller writes it into an Activity heartbeat, so a retry after a
-    scale-in interruption can continue from the research already done. An earlier
-    version passed only the round index, which meant the checkpoint carried no
-    content, `resumed` was structurally always False, and the durability credit
-    could never fire. Unit tests missed it because they injected checkpoints
-    directly instead of producing one.
-
-    Raises RefusalError if the request was declined and no fallback accepted it.
-    """
-    output_config: dict[str, Any] = {"effort": effort}
-    if json_schema is not None:
-        output_config["format"] = {"type": "json_schema", "schema": json_schema}
-
-    request: dict[str, Any] = {
-        "model": MODEL,
-        "max_tokens": max_tokens,
-        "system": system,
-        # Adaptive thinking is the only supported mode on Opus 5 and is on by
-        # default; stated explicitly so the intent is visible. `display` is left
-        # at its default ("omitted") because we never surface reasoning.
-        "thinking": {"type": "adaptive"},
-        "output_config": output_config,
+    config: dict[str, Any] = {
+        "system_instruction": system,
+        "max_output_tokens": max_tokens,
+        "thinking_config": types.ThinkingConfig(thinking_level=thinking_level),
     }
     if tools:
-        request["tools"] = list(tools)
+        config["tools"] = list(tools)
+    if json_schema is not None:
+        config["response_mime_type"] = "application/json"
+        config["response_json_schema"] = json_schema
 
-    betas: list[str] = []
-    if FALLBACKS_ENABLED:
-        betas.append(FALLBACK_BETA)
-        request["fallbacks"] = "default"
+    response = await client().aio.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(**config),
+    )
 
-    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-    out = LLMResult()
+    blocked = _blocked_reason(response)
+    if blocked:
+        raise RefusalError(f"blocked by Gemini safety controls ({blocked})")
 
-    for round_index in range(MAX_PAUSE_RESUMES + 1):
-        response = await client().beta.messages.create(
-            # A COPY: `messages` grows on every pause_turn resume, and handing the
-            # SDK the live list would let a later append mutate a request already
-            # sent. It also keeps each round's payload independently inspectable.
-            messages=list(messages), betas=betas, **request
-        )
-
-        # Check stop_reason BEFORE touching content: a refusal can arrive as a
-        # successful HTTP 200 with content empty (declined before any output) or
-        # partial (declined mid-stream).
-        if response.stop_reason == "refusal":
-            details = getattr(response, "stop_details", None)
-            category = getattr(details, "category", None) if details else None
-            raise RefusalError(f"declined by safety classifiers (category={category})")
-
-        out.usage = out.usage + Usage.from_response(response)
-        _extract(response, out)
-        out.rounds = round_index + 1
-
-        if response.stop_reason != "pause_turn":
-            return out
-
-        # The server-tool loop hit its iteration cap. Re-send the original turn
-        # plus the partial assistant turn and it picks up where it left off — no
-        # extra user message, which would derail it.
-        #
-        # This is the checkpoint boundary: a completed round is the smallest unit
-        # of research that can survive an interruption, because a single in-flight
-        # Claude call produces nothing until it returns.
-        if on_progress is not None:
-            # A SNAPSHOT, not `out` itself. `out` keeps accumulating across rounds,
-            # so handing it over would give the callback an object that silently
-            # changes under it — fine for a callback that copies immediately, a
-            # trap for one that stores the reference.
-            on_progress(
-                LLMResult(
-                    text=out.text,
-                    sources=list(out.sources),
-                    usage=out.usage,
-                    rounds=out.rounds,
-                )
-            )
-        logger.info("pause_turn: resuming round %d", out.rounds + 1)
-        # APPEND. Rebuilding the list as [user, assistant(this round)] looks right
-        # and is only correct for the FIRST resume: on the second it drops round 1's
-        # assistant turn along with its web_search_tool_result blocks, so Claude
-        # resumes from a conversation that no longer contains the searches it already
-        # ran — re-issuing them, and continuing from a different point than it left
-        # off, while `out.text` has still accumulated all three rounds locally. The
-        # result was a spliced answer with duplicated passages.
-        messages.append({"role": "assistant", "content": response.content})
-
-    logger.warning("hit MAX_PAUSE_RESUMES=%d; returning partial", MAX_PAUSE_RESUMES)
-    return out
+    text, sources = _extract(response)
+    return LLMResult(
+        text=text,
+        sources=sources,
+        usage=Usage.from_response(response),
+        rounds=1,
+    )

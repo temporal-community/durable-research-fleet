@@ -1,4 +1,9 @@
-# Research Fleet — Project Context for Claude Code
+# Research Fleet — Instructions for Coding Agents
+
+> **Gemini fork, 2026-08-12.** This copy replaces the original provider-specific
+> seam with the Google Gen AI SDK, Gemini 3.6 Flash, and Google Search grounding.
+> The upstream repository is reference-only and must not be used as a push target.
+> Provider-specific changes belong in this repository.
 
 > **Renamed 2026-07-29** from folder `builder-bot-poc`, prefix `builder-bot`, queue
 > `builder-queue`, image `builder-worker`. Anything still saying those is stale —
@@ -23,11 +28,11 @@ A Temporal **Serverless Worker on GCP Cloud Run**, running **two apps on one Tas
 Queue**:
 
 1. **`HelloWorkflow`** → `say_hello` (5s sleep). The **infrastructure smoke test**.
-   Needs no Claude key, which is what keeps `make verify SCALE=1` usable for
+   Needs no Gemini key, which is what keeps `make verify SCALE=1` usable for
    diagnosing scaling problems without spending tokens. Keep it.
 2. **`ResearchWorkflow`** → the real app (added 2026-07-29). A conference demo: the
    audience asks research questions from their phones, each question fans out into
-   parallel sub-questions researched with Claude + server-side web search, and a
+   parallel sub-questions researched with Gemini + server-side web search, and a
    projector shows the live Serverless Workers count.
 
 The Worker runs in a Cloud Run Worker Pool that Temporal's Worker Controller
@@ -71,11 +76,11 @@ size, and it forced `sys.path` juggling in both Workers. Don't re-introduce
 
 The research app (rationale summarised below; longer notes live in the local-only `decisions/`):
 
-- ✅ `llm.py` — **the Claude seam.** Imports no `temporalio` and must not: it stays
+- ✅ `llm.py` — **the Gemini seam.** Imports no `temporalio` and must not: it stays
   unit-testable without a server, and the retry story lives in exactly one place.
-  `max_retries=0` on purpose — Temporal is the only retry layer.
+  `HttpRetryOptions(attempts=1)` on purpose — Temporal is the only retry layer.
 - ✅ `research_activities.py` — `plan_research`, `research_subquestion` (the fan-out
-  unit), `synthesize`. Heartbeats on a **timer**, not just between rounds.
+  unit), `synthesize`. Heartbeats on a **timer** during long Gemini requests.
 - ✅ `research_workflow.py` — `ResearchWorkflow`, PINNED, fan-out → draft → **human
   review pause** → optional second fan-out. `progress` Query feeds both UIs.
 - ✅ `research_types.py` — transport dataclasses, no third-party imports
@@ -84,7 +89,7 @@ The research app (rationale summarised below; longer notes live in the local-onl
   a sources rail carrying the citation targets (right), and the live fleet counters in a
   sticky footer that scales with the viewport, so the same URL serves a phone and a
   projector. FastAPI, vanilla JS, no build step, no database. Runs on a Cloud Run
-  **Service**, not a Worker Pool. Must not import `llm`/`anthropic`.
+  **Service**, not a Worker Pool. Must not import `llm`/`google.genai`.
   - **The rails exist to shorten the scroll, not to decorate.** Sources and the parts
     ledger live outside the reading column; that is what uses a 1600px screen *and*
     stops the report being a mile long. Below 900px they become a tablist.
@@ -120,70 +125,29 @@ Infra identifiers are `research-fleet` (prefix, deployment name) and
 stack** — the names are baked into every resource — so don't do it casually; the
 2026-07-29 pass cost a full teardown, a fresh VM bootstrap and a new demo URL.
 
-## Verified working
-Local smoke test after any change: one Workflow ≈5.3s, `starter.py --count 5
---watch` ≈25s — serialized on purpose, because MAX_CONCURRENT_ACTIVITIES=1 is what
-makes a burst produce real Task Queue backlog for the WCI to react to. If you ever
-see ~5s for a burst of 5, the slot limit has been lost.
+## Verification status
 
-A Workflow has also completed on a real Cloud Run Worker Pool instance (15.29s
-back when the Activity chain was 3×5s).
+The Temporal/Cloud Run infrastructure observations below come from the upstream
+project's 2026-07 deployments. They remain useful evidence for the platform wiring,
+but they are not proof that this Gemini fork has been deployed.
 
-Offline suite: **90 pytest + 10 terraform test groups**, all green (`make test`).
+For the Gemini fork:
 
-Research app, verified locally 2026-07-29 (Phase 0 — no GCP, no Claude key needed
-for these):
-- Worker starts clean with **no `ANTHROPIC_API_KEY`** — `llm.client()` is lazy, so the
-  hello app and `make verify SCALE=1` are unaffected. A missing key surfaces as a
-  clear `RuntimeError`, not a cryptic failure.
-- The **Serverless Workers counter works and counts**: `/api/fleet` read 1 → 2 as a
-  second Worker joined, with `peak`/`started` derived from rising edges.
-- Web tier end to end: pages serve, guards return 400 (empty / >500 chars), the rate
-  limit returns 429 on the 4th ask in a minute, a question starts a Workflow, and the
-  `progress` Query returns live state.
-- **Observed the documented scale-in lag:** after killing two Workers the counter still
-  read 3 for about a minute. Poller entries age out slowly. Scale-*out* is immediate,
-  which is what the room watches — see `decisions/05-research-agent.md` D-5.4.
+- All 104 Python tests and all 10 Terraform tests pass locally. The provider seam
+  uses offline fakes; tests must never make a real Gemini request.
+- `llm.client()` is lazy. The hello app and `make verify SCALE=1` work without
+  `GEMINI_API_KEY`; the first research call fails with a clear `RuntimeError`.
+- Google Search grounding is one atomic GenerateContent request. Timer heartbeats
+  preserve liveness, but there is no partial model output to checkpoint. If scale-in
+  kills that request, Temporal retries it from the beginning. Already completed
+  sibling findings and the plan remain durable and are not rerun.
+- A real Gemini API research run and a fresh GCP deployment are still required before
+  adding latency, token, search-count, or cache-hit claims to this file.
 
-**The §8 demo beat is verified end to end** (SIGTERM a Worker mid-Activity, restart it):
-
-```
-sub-question 1 cancelled mid-flight; checkpoint recorded
-resuming sub-question 1 from checkpoint (1 rounds, 1000 tokens already spent)
-  [0] resumed=False   [1] resumed=True   [2] resumed=False
-  interruptions survived : 1
-  tokens saved           : 4000
-```
-
-The Workflow survived with **no Workers at all**, resumed on a fresh Worker, and the
-review Signal then completed it. Both halves of the durability story hold: the
-interrupted sub-question continued from its checkpoint, and the two sibling findings
-were never re-run.
-
-> ⚠️ That run found a real bug that every unit test missed — `on_progress` passed only
-> a round index, so the checkpoint carried no content and `resumed` was structurally
-> always `False`. Fixed; guarded by
-> `test_a_completed_round_populates_the_checkpoint`. **Resume works at `pause_turn`
-> round granularity** — an interruption inside the first round has nothing to salvage,
-> because a single in-flight Claude call produces nothing until it returns.
-
-**A genuine research answer is verified** — first full live run against the real API,
-2026-07-29, six sub-questions start to finish:
-
-```
-researching      0/6 findings   searches=0   tokens=    944   cache_read=      0
-researching      3/6 findings   searches=35  tokens=334,830   cache_read=256,485
-awaiting_review  6/6 findings   searches=90  tokens=834,219   cache_read=643,158
-DRAFT READY
-```
-
-**77% of tokens were cache reads** (643K of 834K). That is the shared
-`SYSTEM_RESEARCH` prefix working exactly as designed across a fan-out — which is why
-its length is load-bearing and why you must not interpolate into it. A run of this
-shape costs single-digit dollars; budget for a few of them on the day.
-
-Still needs real GCP: Phase 1 in full (the live run above was local Workers against
-the self-hosted server).
+Local infrastructure smoke test after any change: one Workflow ≈5.3s and
+`starter.py --count 5 --watch` ≈25s. The serialization is deliberate:
+`MAX_CONCURRENT_ACTIVITIES=1` creates the backlog that the WCI scales on. If five
+Workflows finish in roughly 5s, the slot limit has been lost.
 
 ## Cost was removed from the app on 2026-07-29
 Both the UI display and the arithmetic. There is **no dollar figure anywhere** — no
@@ -238,14 +202,14 @@ not regressing:
 Found on the **first real end-to-end deploy, 2026-07-29** (everything above was
 found locally or on a partial stack):
 
-11. **The Anthropic secret must hold a version BEFORE the pool is created.** The
-    pool mounts `ANTHROPIC_API_KEY` as a `secret_key_ref` pinned to `latest`, and
+11. **The Gemini secret must hold a version BEFORE the pool is created.** The
+    pool mounts `GEMINI_API_KEY` as a `secret_key_ref` pinned to `latest`, and
     Cloud Run resolves that at *create* time: an empty secret fails the pool with
     `Error code 9 ... versions/latest was not found`. Terraform creates the secret
     empty on purpose (the key must never enter state — D-5.11) and created the pool
     in the same apply, so **`make up` could never have worked from scratch.** Fixed
     with a `make secret` target (same `-target` idiom as `repo`) sequenced before
-    `apply`; it seeds the real key, or a placeholder when `ANTHROPIC_API_KEY` is
+    `apply`; it seeds the real key, or a placeholder when `GEMINI_API_KEY` is
     unset, and never clobbers an existing version. The old comment in
     `workerpool.tf` asserting an empty secret was tolerable has been corrected.
 12. **The web tier is NOT public. Don't make it public.** ⚠️ This gate said the
@@ -372,26 +336,16 @@ live stack: **16 passed, 0 failed**, including §8 scale-from-zero (pool forced 
 #2 says fails on a released server — and `no-sync AND rate-based` both enabled. The
 only resource that would not apply is the public invoker binding (gate #12).
 
-**The research app is verified on the deployed stack too** — one question, started
-from the VM because the web tier is IAM-blocked (gate #12):
-
-```
-t+30 s  instances=7    researching      0/6 searches=  0 tokens=1,191
-t+60 s  instances=10   researching      2/6 searches= 40 tokens=203,747
-t+180s  instances=10   awaiting_review  6/6 searches=106 tokens=679,239
-then: review Signal "accept" -> done, 2788-char answer, 25 sources, 75% cache reads
-```
-
-**Pool 0 → 7 Serverless Workers in 30 seconds for a single question**, peaking at 10.
-That mapping is the demo, and it now holds on real GCP rather than in theory. The
-whole lifecycle works: plan → fan-out → draft → review pause → Signal → done.
+The upstream research app also demonstrated pool scale-out for a six-way fan-out and
+the full plan → fan-out → draft → review → Signal lifecycle. Do not reuse its API
+latency, token, search, or cache measurements as Gemini baselines; remeasure them.
 
 **`egress = "PRIVATE_RANGES_ONLY"` on the pool is load-bearing for the research
 app.** Private traffic reaches the Temporal VM at `10.10.0.10:7233` through the VPC,
-while `api.anthropic.com` goes out over Cloud Run's default internet egress. There is
-deliberately **no Cloud NAT** and none is needed. Switching this to `ALL_TRAFFIC`
-would route Claude calls into a subnet with no NAT and break every research Activity
-while `make verify SCALE=1` — which needs no Claude key — kept passing. That failure
+while `generativelanguage.googleapis.com` goes out over Cloud Run's default internet
+egress. There is deliberately **no Cloud NAT** and none is needed. Switching this to `ALL_TRAFFIC`
+would route Gemini calls into a subnet with no NAT and break every research Activity
+while `make verify SCALE=1` — which needs no Gemini key — kept passing. That failure
 would look like a broken app, not a network change.
 
 ## Known constraints (don't "fix" these — they're intentional)
@@ -403,7 +357,7 @@ would look like a broken app, not a network change.
   `AUTO_UPGRADE`) — this is a hard Serverless Workers requirement, not
   optional boilerplate.
 - **The hello app is not a placeholder — it's the infrastructure smoke test.** It
-  needs no Claude key, so `make verify SCALE=1` can diagnose a scaling problem
+  needs no Gemini key, so `make verify SCALE=1` can diagnose a scaling problem
   without spending tokens. Don't delete it now the research app exists.
 - The 5s sleep is not arbitrary — it creates the backlog the WCI scales on.
   Don't "optimise" it away.
@@ -411,26 +365,25 @@ would look like a broken app, not a network change.
 Research app (full reasoning in `decisions/05-research-agent.md`):
 - **`MAX_CONCURRENT_ACTIVITIES` stays 1.** With one slot per instance, one question
   → ~6 sub-questions → 6 Serverless Workers. That mapping *is* the demo.
-- **Heartbeat on a timer, not just between rounds.** A research Activity is one long
-  `await`; heartbeating only at `pause_turn` boundaries lets a healthy Activity blow
-  through `heartbeat_timeout` and get killed, burning tokens already spent.
-- **`llm.py` must not import `temporalio`; `web.py` must not import `llm`/`anthropic`.**
+- **Heartbeat on a timer during the call.** A research Activity is one long `await`;
+  without timer heartbeats a healthy call can exceed `heartbeat_timeout` and be
+  killed.
+- **`llm.py` must not import `temporalio`; `web.py` must not import `llm`/`google`.**
   Both enforced by `tests/test_serverless_contract.py`.
-- **Temporal is the only retry layer** (`max_retries=0` on the Anthropic client). So
+- **Temporal is the only retry layer** (`HttpRetryOptions(attempts=1)` on the Google
+  Gen AI client). So
   `RESEARCH_RETRY` has to ride out a 429 alone — hence the 60s max interval.
-- **The timeout budget closes across rounds, not per call.** `llm.complete` makes up
-  to 3 calls per Activity, so `3 × 300s < 1200s start_to_close`. Checking one call
-  against `start_to_close` is the mistake that produced four live timeouts.
-  `heartbeat_timeout` stays 60s regardless — that's the point of the timer.
-- **Every Activity that calls Claude must return its `Usage`.** `plan_research`
+- **The timeout budget closes.** The 300s Gemini HTTP timeout stays below the 1200s
+  Activity `start_to_close`; `heartbeat_timeout` stays 60s because timer heartbeats
+  decouple liveness detection from call duration.
+- **Every Activity that calls Gemini must return its `Usage`.** `plan_research`
   originally returned a bare list and its tokens vanished from the cost counter.
-- **Effort is an env var** (`RESEARCH_EFFORT`, default `medium`), because it is the
-  demo's latency knob and you want it tunable on the day.
-- **Don't trim `SYSTEM_RESEARCH`.** Its length is functional: under 512 tokens Opus 5
-  silently stops caching the prefix, and that prefix is shared across every
-  sub-question in a burst. Never interpolate into it.
-- **Don't declare `code_execution`** alongside `web_search_20260209` — the tool runs
-  it internally and a second execution environment confuses the model.
+- **Thinking level is an env var** (`RESEARCH_EFFORT`, default `medium`; supported:
+  `minimal`, `low`, `medium`, `high`) because it is the demo's latency knob.
+- **Keep `SYSTEM_RESEARCH` constant.** Gemini implicit caching benefits from common
+  prefixes. Do not interpolate request-specific text into the system instruction.
+- **Google Search is a built-in server tool.** Do not add a local scraper or a
+  client-side tool loop unless the architecture is deliberately being changed.
 - **No time-skipping is possible in tests.** The test server rejects Worker
   Versioning, which every Workflow here requires. Not a preference — a hard block.
 - **Don't deploy a new `BUILD_ID` while a Workflow is awaiting review.** Parked

@@ -75,7 +75,7 @@ resource "google_project_service" "apis" {
     "iam.googleapis.com",
     # Needed for project-level IAM bindings (google_project_iam_member).
     "cloudresourcemanager.googleapis.com",
-    # The research app's Claude key lives in Secret Manager rather than in a
+    # The research app's Gemini key lives in Secret Manager rather than in a
     # plaintext env var, because Terraform state is already a known exposure on
     # this repo (*.tfstate* is gitignored precisely because it leaked once).
     "secretmanager.googleapis.com",

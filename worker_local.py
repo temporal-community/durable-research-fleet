@@ -19,7 +19,7 @@ Run:
     temporal worker deployment set-current-version \
         --deployment-name research-fleet --build-id local --yes
 
-    export ANTHROPIC_API_KEY=sk-ant-...   # only the research app needs this
+    export GEMINI_API_KEY=...          # only the research app needs this
     python worker_local.py             # in another
     make web-local                     # in a third, then open http://localhost:8000
 """
