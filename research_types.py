@@ -2,7 +2,7 @@
 
 Plain dataclasses with no third-party imports: Temporal's default converter carries
 them across the Activity boundary, and `web.py` reads them as plain JSON from
-Queries, so the web process never needs the Google Gen AI SDK or an API key.
+Queries, so the web process never needs either provider SDK or an API key.
 """
 
 from __future__ import annotations
@@ -10,6 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from llm import Source, Usage
+
+
+@dataclass
+class ResearchRequest:
+    """Durable Workflow input. Provider selection is per run, never ambient."""
+
+    question: str
+    provider: str = "gemini"
 
 
 @dataclass
@@ -47,8 +55,8 @@ class Finding:
     # fires in production. `attempt > 1` means interrupted and re-run.
     attempt: int = 1
 
-    # Kept in the stable Query/transport shape. Gemini GenerateContent is atomic, so
-    # the current integration always leaves this false and uses `attempt` instead.
+    # Gemini leaves this false because GenerateContent is atomic. Claude sets it
+    # when a retry receives partial work from a pause_turn heartbeat checkpoint.
     resumed: bool = False
 
 
@@ -61,6 +69,10 @@ class Answer:
 
 @dataclass
 class Checkpoint:
-    """Small liveness payload carried by timer heartbeats during an atomic call."""
+    """Small liveness/resume payload carried by Activity heartbeats."""
 
     phase: str = "model_call"
+    provider: str = ""
+    rounds_done: int = 0
+    partial_summary: str = ""
+    tokens_so_far: int = 0

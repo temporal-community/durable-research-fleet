@@ -3,16 +3,17 @@
 [![Temporal](https://img.shields.io/badge/Temporal-Serverless%20Workers-141414?logo=temporal&logoColor=white)](https://temporal.io)
 [![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Run%20Worker%20Pools-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/run/docs/workerpools)
 [![Gemini](https://img.shields.io/badge/Gemini-3.6%20Flash-8E75B2?logo=googlegemini&logoColor=white)](https://ai.google.dev/gemini-api/docs)
-[![Tests](https://img.shields.io/badge/tests-115%20passing-22C55E)](#test-it)
+[![Claude](https://img.shields.io/badge/Claude-optional-D97757?logo=anthropic&logoColor=white)](https://docs.anthropic.com/)
+[![Tests](https://img.shields.io/badge/tests-113%20passing-22C55E)](#test-it)
 [![License](https://img.shields.io/badge/license-Apache--2.0-orange)](LICENSE)
 
 </div>
 
-# Durable Research Fleet — Gemini Edition
+# Durable Research Fleet
 
 **Ask once. Watch a fleet appear, research in parallel, and disappear — while the Workflow stays alive.**
 
-A conference-ready deep-research demo powered by **Temporal Serverless Workers**, **Google Cloud Run**, and **Gemini with Google Search grounding**.
+A conference-ready deep-research demo powered by **Temporal Serverless Workers** and **Google Cloud Run**, with **Gemini + Google Search** as the UI default and **Claude + Web Search** available per request.
 
 One question becomes up to six independent research jobs. Each job maps to one Cloud Run Worker, the pool scales `0 → N → 0`, and Temporal preserves the plan, findings, report, and human-review pause throughout.
 
@@ -26,11 +27,11 @@ One question becomes up to six independent research jobs. Each job maps to one C
 |---|---|---|
 | 🔀 **Research fan-out** | One question becomes ~6 independent sub-questions | Parallel work creates real Task Queue backlog |
 | 🚀 **Workers from zero** | Cloud Run adds one-slot Workers to meet that backlog | The fleet is created for the work, not kept warm |
-| 🔎 **Grounded research** | Gemini researches with server-side Google Search | Findings return with sources instead of unsupported prose |
+| 🔎 **Grounded research** | Choose Gemini + Google Search or Claude + Web Search in the workbench | Findings return with sources instead of unsupported prose |
 | ⏸️ **Durable review** | The Workflow parks with a finished draft and no active task | State survives without an app server or database holding the request open |
 | ⚡ **Wake from zero** | Accept or refine sends a Temporal Signal | A live Workflow wakes even after the Worker Pool has scaled away |
 
-> **Last live infrastructure verification — August 15, 2026:** 16/16 deployment checks passed. Five queued smoke-test Workflows took the Worker Pool from **0 to 4 instances in 20 seconds**. The smoke test uses no Gemini tokens.
+> **Last live infrastructure verification — August 15, 2026:** 16/16 deployment checks passed. Five queued smoke-test Workflows took the Worker Pool from **0 to 4 instances in 20 seconds**. The smoke test uses no model tokens.
 
 ## 🏗 Why this architecture?
 
@@ -44,8 +45,11 @@ flowchart LR
     W --> T["⏳ Temporal<br/>durable source of truth"]
     T --> Q["📬 research-queue"]
     Q --> P["☁️ Cloud Run Worker Pool<br/>0 → N → 0"]
-    P --> G["✨ Gemini 3.6 Flash<br/>Google Search grounding"]
+    P --> S{"Provider in<br/>Workflow input"}
+    S --> G["✨ Gemini 3.6 Flash<br/>Google Search grounding"]
+    S --> C["Claude Opus 5<br/>Web Search"]
     G --> P
+    C --> P
     P --> T
     T -. "Worker Controller scales" .-> P
 ```
@@ -68,11 +72,11 @@ Cloud Run shows the same story from the infrastructure side:
 
 ## 5-minute local quickstart
 
-The infrastructure path needs neither GCP nor a Gemini key.
+The infrastructure path needs neither GCP nor a model key.
 
 ```bash
-git clone <your-fork-url> durable-research-fleet-gemini
-cd durable-research-fleet-gemini
+git clone https://github.com/temporal-community/durable-research-fleet.git
+cd durable-research-fleet
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 ```
@@ -97,9 +101,9 @@ temporal worker deployment set-current-version \
 
 Step 3 is required: every Workflow declares a versioning behavior, so Temporal rejects its Workflow Tasks when the Worker is not in versioned mode.
 
-### Run the Gemini research app
+### Run the research app
 
-Create a `GEMINI_API_KEY` in [Google AI Studio](https://aistudio.google.com/apikey), place it in the gitignored `.env`, then restart the Worker with local-only parallelism:
+Create a `GEMINI_API_KEY` in [Google AI Studio](https://aistudio.google.com/apikey) and place it in the gitignored `.env`. Add `ANTHROPIC_API_KEY` only if you also want the Claude option. Then restart the Worker with local-only parallelism:
 
 ```bash
 set -a; . ./.env; set +a
@@ -107,16 +111,20 @@ MAX_CONCURRENT_ACTIVITIES=6 .venv/bin/python worker_local.py
 make web-local
 ```
 
-Open **http://localhost:8000**. One run uses one planning call, up to six grounded research calls, and one synthesis call. A refine decision may trigger one additional bounded fan-out.
+Open **http://localhost:8000** and choose a provider next to the ask button. Gemini is selected by default. The choice is recorded in Workflow input, so retries, review, and refinement stay on that provider even when both modes run in the same deployment.
+
+One run uses one planning call, up to six grounded research calls, and one synthesis call. A refine decision may trigger one additional bounded fan-out.
 
 The higher slot count is only for local development. Keep the deployed value at `1`: one Activity slot per instance is what turns a six-way fan-out into a visible Serverless Worker fleet.
 
 ## Deploy to GCP
 
-You need a GCP project, `gcloud`, Docker, Terraform, and a Gemini key. `PROJECT` must be set explicitly unless you own the repository's default demo project.
+You need a GCP project, `gcloud`, Docker, Terraform, and a Gemini key. An Anthropic key is optional. `PROJECT` must be set explicitly unless you own the repository's default demo project.
 
 ```bash
 export GEMINI_API_KEY=your-key
+# Optional: enables the Claude choice in the same workbench
+# export ANTHROPIC_API_KEY=your-key
 
 make up AUTO=1 PROJECT=your-project-id
 make register-queues PROJECT=your-project-id
@@ -155,7 +163,7 @@ The deployed shape is:
 | Temporal | Compute Engine VM | Private frontend at `10.10.0.10:7233`; runs the prerelease Worker Controller |
 | Research fleet | Cloud Run Worker Pool | Manual count controlled by Temporal; normally zero when idle |
 | Web tier | Cloud Run Service | Internal ingress and authenticated invocation only |
-| Model key | Secret Manager | Mounted into Workers; never passed through Terraform state |
+| Model keys | Secret Manager | Both refs mount into Workers; values never pass through Terraform state |
 | Worker image | Artifact Registry | One image with Worker and web entrypoints |
 
 After rebuilding the image with the same tag, force the Worker Pool onto the new digest; Cloud Run pins image digests per revision. See [AGENTS.md](AGENTS.md) gate #14 for the exact command and the other deployment invariants.
@@ -169,7 +177,8 @@ plan → fan out research → synthesize → wait for review → accept or refin
 - `HelloWorkflow` is the token-free infrastructure smoke test. Its five-second Activity creates the backlog used to verify scaling.
 - `ResearchWorkflow` is the real application. It plans, fans out, synthesizes, pauses for review, and optionally performs one refinement round.
 - `runtime.py` is app-agnostic infrastructure. Both applications plug into its versioned Worker seam.
-- `llm.py` is the Gemini seam. Temporal is the only retry layer; Google Search is a built-in server tool.
+- `llm.py` is the dual-provider seam. Temporal is the only Activity retry layer; both search tools run server-side.
+- Provider selection is per Workflow, not an environment switch. Gemini's grounded call is atomic; Claude additionally preserves its `pause_turn` / `_resume_from` continuation path, ephemeral cache marker, and `MAX_PAUSE_RESUMES` bound.
 
 ## Configuration
 
@@ -182,9 +191,11 @@ Local defaults target `temporal server start-dev`.
 | `TEMPORAL_DEPLOYMENT_NAME` | `research-fleet` | Versioned Worker Deployment name |
 | `MAX_CONCURRENT_ACTIVITIES` | `1` | Activity slots per Worker; raising this hides deployed scaling |
 | `MAX_SUBQUESTIONS` | `6` | Fan-out width and approximate Worker count per question |
-| `RESEARCH_EFFORT` | `medium` | Gemini thinking level: `minimal`, `low`, `medium`, or `high` |
+| `RESEARCH_EFFORT` | `medium` | Provider effort / thinking level |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Model selected without rebuilding the image |
 | `GEMINI_API_KEY` | unset | Required only when a research Activity first calls Gemini |
+| `ANTHROPIC_MODEL` | `claude-opus-5` | Claude model selected without rebuilding the image |
+| `ANTHROPIC_API_KEY` | unset | Required only when the UI selection is Claude |
 | `DEMO_PASSCODE` | unset | Guards both asking and refinement actions in the web tier |
 
 ## Test it
@@ -193,7 +204,8 @@ Local defaults target `temporal server start-dev`.
 make test
 ```
 
-The suite is offline: **105 Python tests + 10 Terraform contract tests**. Gemini calls use fakes and never spend tokens.
+The suite is offline: **113 Python tests + 10 Terraform contract tests**. Both
+provider clients use fakes and tests never spend tokens.
 
 For the live infrastructure gate:
 
@@ -207,7 +219,7 @@ make verify SCALE=1 PROJECT=your-project-id
 |---|---|
 | `runtime.py` | Connection, versioned Worker, slot limits, unique identity, graceful shutdown |
 | `workflows.py` · `activities.py` | Token-free infrastructure smoke test |
-| `llm.py` | Gemini + Google Search boundary, isolated from Temporal |
+| `llm.py` | Gemini/Claude provider boundary, isolated from Temporal |
 | `research_*.py` | Plan, parallel research, synthesis, review, and transport types |
 | `web.py` · `web/` | Responsive workbench; FastAPI and vanilla JS, no build step |
 | `terraform/` | Complete private GCP stack |
@@ -224,4 +236,4 @@ Bundled fonts are redistributed under the SIL Open Font License (`web/fonts/LICE
 
 ---
 
-This Gemini edition is a provider port of the original [Durable Research Fleet](https://github.com/temporal-community/durable-research-fleet), created by [Shubham Londhe (@LondheShubham153)](https://github.com/LondheShubham153).
+Built from the original [Durable Research Fleet](https://github.com/temporal-community/durable-research-fleet), created by [Shubham Londhe (@LondheShubham153)](https://github.com/LondheShubham153).

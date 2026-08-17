@@ -164,6 +164,21 @@ variable "gemini_api_key" {
   sensitive   = true
 }
 
+variable "anthropic_api_key" {
+  description = <<-EOT
+    Anthropic API key for the optional Claude UI selection. Leave null and populate
+    Secret Manager out of band to keep it out of Terraform state:
+
+      printf %s "$ANTHROPIC_API_KEY" | gcloud secrets versions add \
+        research-fleet-anthropic-api-key --data-file=- --project <project>
+
+    The Worker Pool reads it; the web tier receives neither provider key.
+  EOT
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
 variable "demo_passcode" {
   description = "Optional shared passcode for the public phone page, announced from the stage. Empty means anyone who finds the URL can spend tokens — see the bounding controls in web.tf."
   type        = string
@@ -213,4 +228,10 @@ variable "gemini_model" {
   description = "Gemini model ID used by the research app. The default is the GA Gemini 3.6 Flash model."
   type        = string
   default     = "gemini-3.6-flash"
+}
+
+variable "anthropic_model" {
+  description = "Claude model ID used when a Workflow selects Anthropic."
+  type        = string
+  default     = "claude-opus-5"
 }

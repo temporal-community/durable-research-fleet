@@ -10,6 +10,7 @@ properties are what stand between the demo and a silently-restarted research tas
 """
 
 import asyncio
+import dataclasses
 import inspect
 
 import pytest
@@ -17,7 +18,7 @@ from temporalio.testing import ActivityEnvironment
 
 import llm
 import research_activities as ra
-from research_types import Finding, SubQuestion
+from research_types import Checkpoint, Finding, SubQuestion
 
 
 def _result(text="ok", sources=(), tokens=0, rounds=1):
@@ -173,7 +174,87 @@ async def test_research_heartbeats_when_cancelled(monkeypatch, stub_llm):
     assert beats, "cancellation must emit a final heartbeat"
 
 
-# --- research: atomic response --------------------------------------------
+# --- research: provider-specific resume semantics --------------------------
+
+
+async def test_claude_pause_turn_populates_a_bounded_checkpoint(
+    monkeypatch, stub_llm
+):
+    monkeypatch.setattr(ra, "HEARTBEAT_INTERVAL_SECONDS", 30)
+
+    async def two_rounds(**kw):
+        kw["on_progress"](
+            llm.LLMResult(
+                text="x" * 50_000,
+                usage=llm.Usage(input_tokens=700, output_tokens=300),
+                rounds=1,
+            )
+        )
+        return _result("final", rounds=2)
+
+    calls = stub_llm(two_rounds)
+    beats = []
+    env = ActivityEnvironment()
+    env.on_heartbeat = lambda *a: beats.append(a[0])
+
+    await env.run(ra.research_subquestion, SubQuestion(0, "q"), "anthropic")
+
+    assert calls[0]["provider"] == "anthropic"
+    assert beats[-1].provider == "anthropic"
+    assert beats[-1].rounds_done == 1
+    assert beats[-1].tokens_so_far == 1000
+    assert len(beats[-1].partial_summary) == ra.CHECKPOINT_SUMMARY_CHARS
+
+
+async def test_claude_retry_resumes_from_heartbeat_details(stub_llm):
+    calls = stub_llm(lambda **kw: _result("final answer"))
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(
+        env.info,
+        attempt=2,
+        heartbeat_details=[
+            {
+                "provider": "anthropic",
+                "rounds_done": 2,
+                "partial_summary": "Austin inventory rose 12%.",
+                "tokens_so_far": 4321,
+            }
+        ],
+    )
+
+    finding = await env.run(
+        ra.research_subquestion, SubQuestion(index=1, text="q"), "anthropic"
+    )
+
+    assert finding.resumed is True
+    assert "Austin inventory rose 12%." in calls[0]["prompt"]
+    assert "interrupted" in calls[0]["prompt"]
+
+
+async def test_gemini_ignores_partial_checkpoint_because_the_call_is_atomic(stub_llm):
+    calls = stub_llm(lambda **kw: _result("answer"))
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(
+        env.info,
+        attempt=2,
+        heartbeat_details=[
+            {
+                "provider": "anthropic",
+                "partial_summary": "must not cross providers",
+            }
+        ],
+    )
+
+    finding = await env.run(
+        ra.research_subquestion, SubQuestion(index=0, text="q"), "gemini"
+    )
+
+    assert finding.resumed is False
+    assert "must not cross providers" not in calls[0]["prompt"]
+    assert calls[0]["on_progress"] is None
+
+
+# --- research: atomic Gemini response -------------------------------------
 
 
 async def test_research_is_not_marked_resumed(stub_llm):
@@ -215,7 +296,7 @@ async def test_research_declares_web_search_and_a_tunable_effort(stub_llm):
     """
     calls = stub_llm(lambda **kw: _result())
     await ActivityEnvironment().run(ra.research_subquestion, SubQuestion(0, "q"))
-    assert calls[0]["tools"] == [llm.WEB_SEARCH_TOOL]
+    assert calls[0]["web_search"] is True
     assert calls[0]["effort"] == ra.RESEARCH_EFFORT
     assert ra.RESEARCH_EFFORT in ("minimal", "low", "medium", "high")
 
@@ -383,6 +464,10 @@ def test_the_timeout_budget_closes():
     import research_workflow as rw
 
     assert llm.HTTP_TIMEOUT_SECONDS < rw.RESEARCH_START_TO_CLOSE_SECONDS
+    assert (
+        (llm.MAX_PAUSE_RESUMES + 1) * llm.ANTHROPIC_HTTP_TIMEOUT_SECONDS
+        < rw.RESEARCH_START_TO_CLOSE_SECONDS
+    )
 
 
 def test_http_timeout_is_generous_enough_for_web_search():

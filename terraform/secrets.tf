@@ -31,3 +31,28 @@ resource "google_secret_manager_secret_iam_member" "worker_reads_gemini" {
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.worker_rt.email}"
 }
+
+# Claude is an opt-in selection in the same UI. The Worker Pool mounts both keys so
+# provider choice can be captured per Workflow rather than fixed per deployment.
+resource "google_secret_manager_secret" "anthropic" {
+  secret_id = "${local.prefix}-anthropic-api-key"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "anthropic" {
+  count = var.anthropic_api_key == null ? 0 : 1
+
+  secret      = google_secret_manager_secret.anthropic.id
+  secret_data = var.anthropic_api_key
+}
+
+resource "google_secret_manager_secret_iam_member" "worker_reads_anthropic" {
+  secret_id = google_secret_manager_secret.anthropic.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.worker_rt.email}"
+}

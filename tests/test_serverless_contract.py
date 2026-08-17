@@ -61,7 +61,7 @@ def test_every_workflow_declares_a_versioning_behavior(module):
 
 def test_both_apps_are_registered_on_the_pool():
     """The hello app is the infrastructure smoke test and must stay registered: it
-    is the only path `make verify SCALE=1` can exercise without a Gemini key.
+    is the only path `make verify SCALE=1` can exercise without either model key.
     """
     for path in ("worker_cloudrun.py", "worker_local.py"):
         src = open(path).read()
@@ -125,8 +125,8 @@ def test_long_activities_heartbeat_on_a_timer_not_only_between_rounds():
 
 
 def test_long_activities_record_cancellation_before_retry():
-    """KB §7.3. Gemini responses are atomic, but cancellation must still heartbeat
-    so Temporal can observe the lost attempt and retry it promptly.
+    """KB §7.3. Cancellation must heartbeat so Temporal can retry promptly and,
+    for Claude, retain the latest completed pause_turn checkpoint.
     """
     src = inspect.getsource(research_activities.research_subquestion)
     assert "CancelledError" in src and "activity.heartbeat(state)" in src
@@ -259,7 +259,7 @@ def test_runtime_is_app_agnostic():
 
 
 def test_the_web_tier_does_not_import_the_research_app():
-    """`web.py` runs in the same image but must not pull in the Gemini SDK.
+    """`web.py` runs in the same image but must not pull in either model SDK.
 
     It starts, queries and signals Workflows by NAME, so the request-serving process
     needs no GEMINI_API_KEY and no shared types to keep in sync. An import here
@@ -277,6 +277,7 @@ def test_the_web_tier_does_not_import_the_research_app():
 
     leaked = imported & {
         "google",
+        "anthropic",
         "llm",
         "research_workflow",
         "research_activities",
@@ -307,13 +308,13 @@ def test_the_llm_seam_does_not_import_temporal():
 
 def test_only_temporal_retries():
     """Two retry layers multiply into latency nobody can reason about, and a
-    hand-rolled one is the thing this demo argues against. The Google client is
-    configured for one attempt and the Activity's RetryPolicy owns recovery — which
-    means the policy has to be able to ride out a 429 on its own.
+    hand-rolled one is the thing this demo argues against. Both clients disable SDK
+    retries and the Activity's RetryPolicy owns recovery, including 429s.
     """
     import llm
 
     assert "HttpRetryOptions(attempts=1)" in inspect.getsource(llm.client)
+    assert "max_retries=0" in inspect.getsource(llm.anthropic_client)
     policy = research_workflow.RESEARCH_RETRY
     assert policy.maximum_interval.total_seconds() >= 60
     assert policy.maximum_attempts >= 5

@@ -32,6 +32,7 @@ BUILD_ID ?= v1
 # research-fleet/research-queue and renaming them forces resource recreation for no gain.
 TASK_QUEUE ?= research-queue
 GEMINI_MODEL ?= gemini-3.6-flash
+ANTHROPIC_MODEL ?= claude-opus-5
 
 # CLI main currently pins a July auto-scaled-workers revision whose GCP provider
 # sends the camelCase field mask scaling.manualInstanceCount over gRPC. Cloud Run
@@ -67,7 +68,8 @@ TF_VARS := \
   -var="deployment_name=$(PREFIX)" \
   -var="task_queue=$(TASK_QUEUE)" \
   -var="build_id=$(BUILD_ID)" \
-  -var="gemini_model=$(GEMINI_MODEL)"
+  -var="gemini_model=$(GEMINI_MODEL)" \
+  -var="anthropic_model=$(ANTHROPIC_MODEL)"
 
 # Fail fast rather than half-deploying on a mismatch.
 #
@@ -140,8 +142,8 @@ image: ## Build linux/amd64 image and push
 	docker build --platform linux/amd64 -t $(IMAGE) .
 	docker push $(IMAGE)
 
-# The pool mounts GEMINI_API_KEY as a secret_key_ref pinned to version "latest",
-# and Cloud Run resolves that AT POOL CREATE TIME. If the secret has no versions it
+# The pool mounts both provider keys as secret refs pinned to "latest", and Cloud
+# Run resolves them AT POOL CREATE TIME. If either secret has no versions it
 # refuses to create the pool at all:
 #
 #   Error code 9: spec.template.spec.containers[0].env[8].value_from.secret_key_ref
@@ -155,9 +157,10 @@ image: ## Build linux/amd64 image and push
 # Same idiom as `repo` above: one -target apply to break a create-time ordering
 # cycle a single apply cannot express. Idempotent — it never clobbers an existing
 # version, because doing so would repoint "latest" at a placeholder on a live stack.
-secret: check-config ## Create the Gemini secret and seed a version (must precede the pool)
+secret: check-config ## Create both provider secrets and seed versions (must precede the pool)
 	$(TF) init -upgrade
-	$(TF) apply -target=google_secret_manager_secret.gemini $(TF_VARS) -auto-approve
+	$(TF) apply -target=google_secret_manager_secret.gemini \
+	  -target=google_secret_manager_secret.anthropic $(TF_VARS) -auto-approve
 	@if gcloud secrets versions list $(PREFIX)-gemini-api-key --project=$(PROJECT) \
 	      --filter='state=enabled' --format='value(name)' 2>/dev/null | grep -q .; then \
 	  echo "==> secret already holds an enabled version; leaving it untouched"; \
@@ -173,9 +176,22 @@ secret: check-config ## Create the Gemini secret and seed a version (must preced
 	  echo "    research Activities will fail until you run:"; \
 	  echo "      make -s print-set-key"; \
 	fi
+	@if gcloud secrets versions list $(PREFIX)-anthropic-api-key --project=$(PROJECT) \
+	      --filter='state=enabled' --format='value(name)' 2>/dev/null | grep -q .; then \
+	  echo "==> Anthropic secret already holds an enabled version; leaving it untouched"; \
+	elif [ -n "$$ANTHROPIC_API_KEY" ]; then \
+	  printf %s "$$ANTHROPIC_API_KEY" | gcloud secrets versions add \
+	    $(PREFIX)-anthropic-api-key --data-file=- --project=$(PROJECT) >/dev/null; \
+	  echo "==> stored ANTHROPIC_API_KEY (never passed through Terraform)"; \
+	else \
+	  printf %s unset | gcloud secrets versions add \
+	    $(PREFIX)-anthropic-api-key --data-file=- --project=$(PROJECT) >/dev/null; \
+	  echo "==> ANTHROPIC_API_KEY unset — seeded a placeholder; Gemini remains usable"; \
+	fi
 
-print-set-key: ## Print the command that stores a real Gemini key
+print-set-key: ## Print commands that store real provider keys
 	@$(TF) output -raw set_gemini_key; echo ""
+	@$(TF) output -raw set_anthropic_key; echo ""
 
 plan: check-config ## Show the plan
 	$(TF) init -upgrade

@@ -1,15 +1,14 @@
 """The research Activities — the app layer. `runtime.py` is untouched by this file.
 
     plan_research        one call, JSON-schema constrained      ~15s
-    research_subquestion one call + server-side web search   1-5 min   <- fans out
+    research_subquestion provider server-side web search    1-5 min   <- fans out
     synthesize           one call over the collected findings   ~1 min
 
 Those durations are measured from the original implementation, and they are why the
-timeouts remain generous: Google Search grounding happens inside one long Gemini API
-request. The heartbeat runs on a timer while that request is in flight, so the server
-can distinguish "still working" from "instance scaled away". GenerateContent returns
-atomically; a killed in-flight call is retried from the beginning, while completed
-sibling findings remain durable in Workflow history.
+timeouts remain generous. The heartbeat runs on a timer while a provider request is
+in flight, so the server can distinguish "still working" from "instance scaled away".
+Gemini returns atomically; Claude can additionally checkpoint at ``pause_turn``
+boundaries. Completed sibling findings remain durable in both modes.
 """
 
 from __future__ import annotations
@@ -49,6 +48,9 @@ MIN_SUBQUESTIONS = min(3, MAX_SUBQUESTIONS)
 # pages; showing them all buries the answer on a phone screen.
 MAX_SOURCES_SHOWN = 25
 
+# Heartbeat details ride every heartbeat, so partial Claude output is bounded.
+CHECKPOINT_SUMMARY_CHARS = 4_000
+
 # The demo's latency knob, and an env var so it is tunable on the day with no
 # rebuild. `high` ran a single sub-question past the original 120s timeout.
 RESEARCH_EFFORT = os.environ.get("RESEARCH_EFFORT", "medium").strip()
@@ -63,9 +65,9 @@ SYNTHESIS_EFFORT = os.environ.get("SYNTHESIS_EFFORT", "high").strip()
 # Prompts
 # --------------------------------------------------------------------------
 
-# Byte-identical across every sub-question in a burst. Gemini implicit caching is
-# automatic for supported requests and benefits from a common prefix, but no manual
-# provider-specific cache marker belongs in the prompt. Never interpolate into it.
+# Byte-identical across every sub-question in a burst. Gemini benefits from implicit
+# caching. The Claude adapter adds its ephemeral marker at the provider boundary, so
+# no provider-specific object belongs in this shared prompt. Never interpolate.
 SYSTEM_RESEARCH = """You are a research analyst working on one narrow sub-question that forms part of a larger investigation. Another analyst will combine your answer with several others, so your job is depth on your specific sub-question rather than breadth across the whole topic. Do not try to answer the broader question you can infer around it.
 
 Method:
@@ -156,13 +158,42 @@ async def _heartbeating(state: Checkpoint, interval: float | None = None):
             await task
 
 
+def _resume_from(provider: str) -> Checkpoint | None:
+    """Read Claude's last completed pause_turn checkpoint on an Activity retry.
+
+    Gemini heartbeats contain liveness only and are deliberately ignored: an atomic
+    grounded request has no partial model/tool state that can be resumed.
+    """
+    if provider != "anthropic":
+        return None
+    details = activity.info().heartbeat_details
+    if not details:
+        return None
+    raw = details[-1]
+    if isinstance(raw, Checkpoint):
+        checkpoint = raw
+    elif isinstance(raw, dict):
+        checkpoint = Checkpoint(
+            phase=raw.get("phase", "model_call") or "model_call",
+            provider=raw.get("provider", "anthropic") or "anthropic",
+            rounds_done=raw.get("rounds_done", 0) or 0,
+            partial_summary=raw.get("partial_summary", "") or "",
+            tokens_so_far=raw.get("tokens_so_far", 0) or 0,
+        )
+    else:
+        return None
+    return checkpoint if checkpoint.provider in ("", "anthropic") else None
+
+
 # --------------------------------------------------------------------------
 # Activities
 # --------------------------------------------------------------------------
 
 
 @activity.defn
-async def plan_research(question: str) -> ResearchPlan:
+async def plan_research(
+    question: str, provider: str = llm.DEFAULT_PROVIDER
+) -> ResearchPlan:
     """Split the question into independent, parallel-researchable sub-questions.
 
     Returns the plan AND its usage. Returning a bare list dropped the planning
@@ -180,9 +211,11 @@ async def plan_research(question: str) -> ResearchPlan:
         "additionalProperties": False,
     }
 
-    state = Checkpoint()
+    provider = llm.normalize_provider(provider)
+    state = Checkpoint(provider=provider)
     async with _heartbeating(state):
         result = await llm.complete(
+            provider=provider,
             system=SYSTEM_PLAN,
             prompt=(
                 f"Research question:\n\n{question}\n\n"
@@ -212,31 +245,64 @@ async def plan_research(question: str) -> ResearchPlan:
 
 
 @activity.defn
-async def research_subquestion(sub: SubQuestion) -> Finding:
-    """Research one sub-question with Google Search grounding.
+async def research_subquestion(
+    sub: SubQuestion, provider: str = llm.DEFAULT_PROVIDER
+) -> Finding:
+    """Research one sub-question with the selected provider's server-side search.
 
     The fan-out unit: N of these hit the Task Queue at once, N-1 fail to sync-match
     against the current pool, and the Worker Controller scales up to meet them.
     """
-    state = Checkpoint()
+    provider = llm.normalize_provider(provider)
+    resume = _resume_from(provider)
+    state = Checkpoint(
+        provider=provider,
+        rounds_done=resume.rounds_done if resume else 0,
+        partial_summary=resume.partial_summary if resume else "",
+        tokens_so_far=resume.tokens_so_far if resume else 0,
+    )
     prompt = f"Sub-question:\n\n{sub.text}"
+    if resume and resume.partial_summary:
+        activity.logger.info(
+            "resuming Claude sub-question %d from checkpoint (%d rounds, %d tokens)",
+            sub.index,
+            resume.rounds_done,
+            resume.tokens_so_far,
+        )
+        prompt += (
+            "\n\nA previous attempt was interrupted after a completed research "
+            "round. Here is what it had already established:\n\n"
+            f"{resume.partial_summary}\n\n"
+            "Continue from there. Verify anything shaky, fill the gaps, and return "
+            "the complete answer without repeating searches already reflected above."
+        )
+
+    def checkpoint(partial: llm.LLMResult) -> None:
+        """Persist a completed Claude pause_turn round for a later Activity attempt."""
+        state.rounds_done = partial.rounds
+        state.partial_summary = partial.text.strip()[:CHECKPOINT_SUMMARY_CHARS]
+        state.tokens_so_far = partial.usage.total_tokens
+        activity.heartbeat(state)
 
     try:
         async with _heartbeating(state):
             result = await llm.complete(
+                provider=provider,
                 system=SYSTEM_RESEARCH,
                 prompt=prompt,
-                tools=[llm.WEB_SEARCH_TOOL],
+                web_search=True,
+                cache_system=True,
                 max_tokens=16_000,
                 effort=RESEARCH_EFFORT,
+                on_progress=checkpoint if provider == "anthropic" else None,
             )
     except asyncio.CancelledError:
         # Graceful shutdown during scale-in cancels in-flight Activities. Emit one
-        # final heartbeat so Temporal detects the lost attempt promptly. Gemini's
-        # atomic response has no partial text to carry across the retry.
+        # final heartbeat so Temporal detects the lost attempt promptly. For Claude
+        # it carries the latest pause_turn; Gemini carries liveness only.
         activity.heartbeat(state)
         activity.logger.warning(
-            "sub-question %d cancelled mid-flight; retry will restart the call",
+            "sub-question %d cancelled mid-flight; checkpoint recorded",
             sub.index,
         )
         raise
@@ -250,12 +316,16 @@ async def research_subquestion(sub: SubQuestion) -> Finding:
         rounds=result.rounds,
         # The interruption signal the footer actually keys on — see Finding.attempt.
         attempt=activity.info().attempt,
-        resumed=False,
+        resumed=bool(resume and resume.partial_summary),
     )
 
 
 @activity.defn
-async def synthesize(question: str, findings: list[Finding]) -> Answer:
+async def synthesize(
+    question: str,
+    findings: list[Finding],
+    provider: str = llm.DEFAULT_PROVIDER,
+) -> Answer:
     """Combine the findings into one report that CITES the sources by number.
 
     Order matters here, and it is the whole reason this function is shaped this way.
@@ -302,9 +372,11 @@ async def synthesize(question: str, findings: list[Finding]) -> Answer:
 
     prompt = "".join(parts)
 
-    state = Checkpoint()
+    provider = llm.normalize_provider(provider)
+    state = Checkpoint(provider=provider)
     async with _heartbeating(state):
         result = await llm.complete(
+            provider=provider,
             system=SYSTEM_SYNTHESIS,
             prompt=prompt,
             max_tokens=16_000,

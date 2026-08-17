@@ -45,6 +45,15 @@ output "set_gemini_key" {
   ])
 }
 
+output "set_anthropic_key" {
+  description = "Populate the optional Claude key without putting it in Terraform state"
+  value = join(" ", [
+    "printf %s \"$ANTHROPIC_API_KEY\" | gcloud secrets versions add",
+    google_secret_manager_secret.anthropic.secret_id,
+    "--data-file=- --project ${var.project_id}",
+  ])
+}
+
 output "chaos" {
   description = "Interrupt a Serverless Worker mid-research. Deliberately a terminal command, not an endpoint on the public page."
   value = join(" ", [

@@ -106,6 +106,20 @@ def test_no_passcode_configured_means_open(monkeypatch):
     assert web._passcode_ok("anything")
 
 
+def test_provider_is_chosen_in_the_ui_and_gemini_is_default():
+    page = (pathlib.Path(__file__).parent.parent / "web" / "index.html").read_text()
+    gemini = '<option value="gemini" selected>'
+    claude = '<option value="anthropic">'
+    assert gemini in page and claude in page
+    assert page.index(gemini) < page.index(claude)
+    assert "JSON.stringify({ question, provider" in page
+
+    src = inspect.getsource(web.ask)
+    assert 'body.get("provider")' in src
+    assert '"provider": provider' in src
+    assert "provider not in PROVIDERS" in src
+
+
 def test_every_endpoint_that_spends_money_checks_the_passcode():
     """REGRESSION, found reviewing the Code Exchange submission. `/api/ask` was
     guarded by both the passcode and the per-IP limit; `/api/run/{id}/decision` was

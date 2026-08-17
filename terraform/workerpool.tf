@@ -86,6 +86,10 @@ resource "google_cloud_run_v2_worker_pool" "fleet" {
         value = var.gemini_model
       }
       env {
+        name  = "ANTHROPIC_MODEL"
+        value = var.anthropic_model
+      }
+      env {
         # The research app's Gemini key, injected from Secret Manager rather than
         # a plaintext value so it never lands in Terraform state.
         #
@@ -108,6 +112,18 @@ resource "google_cloud_run_v2_worker_pool" "fleet" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.gemini.secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        # Optional Claude mode is selected per Workflow in the UI, so the same pool
+        # needs access to this second key. `make secret` guarantees a version exists;
+        # it may be a placeholder until Claude mode is actually used.
+        name = "ANTHROPIC_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.anthropic.secret_id
             version = "latest"
           }
         }
@@ -151,6 +167,7 @@ resource "google_cloud_run_v2_worker_pool" "fleet" {
     # Without the accessor binding first, the pool's containers fail to start with
     # a secret-access error rather than a useful message.
     google_secret_manager_secret_iam_member.worker_reads_gemini,
+    google_secret_manager_secret_iam_member.worker_reads_anthropic,
     # Puts the pool downstream of the sleep, so teardown is:
     # pool -> brief wait -> subnet (see time_sleep.vpc_release for the caveat).
     time_sleep.vpc_release,

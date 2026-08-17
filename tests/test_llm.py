@@ -70,6 +70,40 @@ class _Fake:
         return self.response
 
 
+class _AnthropicFake:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+        self.beta = self
+        self.messages = self
+
+    async def create(self, **kw):
+        self.calls.append(kw)
+        return self.responses.pop(0)
+
+
+def _claude_response(text, *, stop_reason="end_turn", searches=0):
+    content = [_Obj(type="text", text=text)]
+    if searches:
+        content.append(
+            _Obj(
+                type="web_search_tool_result",
+                content=[_Obj(url="https://claude.example", title="Claude source")],
+            )
+        )
+    return _Obj(
+        content=content,
+        stop_reason=stop_reason,
+        usage=_Obj(
+            input_tokens=10,
+            output_tokens=5,
+            cache_read_input_tokens=3,
+            cache_creation_input_tokens=2,
+            server_tool_use=_Obj(web_search_requests=searches),
+        ),
+    )
+
+
 @pytest.fixture
 def fake(monkeypatch):
     def install(response):
@@ -207,3 +241,58 @@ def test_usage_from_a_response_missing_usage_is_zero():
 def test_retries_are_left_to_temporal():
     src = inspect.getsource(llm.client)
     assert "HttpRetryOptions(attempts=1)" in src
+
+
+async def test_claude_preserves_pause_turn_resume_and_cache_control(monkeypatch):
+    fake = _AnthropicFake(
+        [
+            _claude_response("first ", stop_reason="pause_turn", searches=1),
+            _claude_response("second"),
+        ]
+    )
+    monkeypatch.setattr(llm, "anthropic_client", lambda: fake)
+    progress = []
+
+    out = await llm.complete(
+        provider="anthropic",
+        system="stable shared prefix",
+        prompt="research this",
+        web_search=True,
+        cache_system=True,
+        on_progress=progress.append,
+    )
+
+    assert out.text == "first second"
+    assert out.rounds == 2
+    assert out.usage.web_searches == 1
+    assert [s.url for s in out.sources] == ["https://claude.example"]
+    assert progress[0].text == "first " and progress[0].rounds == 1
+    assert fake.calls[0]["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert fake.calls[0]["tools"] == [llm.ANTHROPIC_WEB_SEARCH_TOOL]
+    # The second request carries the completed assistant/tool turn, which is the
+    # provider-side continuation that MAX_PAUSE_RESUMES bounds.
+    assert len(fake.calls[1]["messages"]) == 2
+
+
+async def test_claude_pause_turn_loop_is_bounded(monkeypatch):
+    fake = _AnthropicFake(
+        [
+            _claude_response(f"round {i} ", stop_reason="pause_turn")
+            for i in range(llm.MAX_PAUSE_RESUMES + 1)
+        ]
+    )
+    monkeypatch.setattr(llm, "anthropic_client", lambda: fake)
+
+    out = await llm.complete(
+        provider="anthropic", system="s", prompt="p", web_search=True
+    )
+
+    assert len(fake.calls) == llm.MAX_PAUSE_RESUMES + 1
+    assert out.rounds == llm.MAX_PAUSE_RESUMES + 1
+
+
+def test_provider_selection_is_explicit_and_defaults_to_gemini():
+    assert llm.normalize_provider(None) == "gemini"
+    assert llm.normalize_provider(" ANTHROPIC ") == "anthropic"
+    with pytest.raises(ValueError, match="unsupported research provider"):
+        llm.normalize_provider("auto")

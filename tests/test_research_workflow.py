@@ -45,7 +45,8 @@ def _mocks(*, n_subs=3, resumed=(), retried=(), plan_texts=None):
     calls: dict = {"plan": [], "research": [], "synth": 0}
 
     @activity.defn(name="plan_research")
-    async def plan(question: str) -> ResearchPlan:
+    async def plan(question: str, provider: str) -> ResearchPlan:
+        calls.setdefault("providers", []).append(provider)
         calls["plan"].append(question)
         texts = plan_texts or [f"sub {i}" for i in range(n_subs)]
         return ResearchPlan(
@@ -54,7 +55,8 @@ def _mocks(*, n_subs=3, resumed=(), retried=(), plan_texts=None):
         )
 
     @activity.defn(name="research_subquestion")
-    async def research(sub: SubQuestion) -> Finding:
+    async def research(sub: SubQuestion, provider: str) -> Finding:
+        calls.setdefault("providers", []).append(provider)
         calls["research"].append(sub.index)
         return Finding(
             index=sub.index,
@@ -69,7 +71,8 @@ def _mocks(*, n_subs=3, resumed=(), retried=(), plan_texts=None):
         )
 
     @activity.defn(name="synthesize")
-    async def synth(question: str, findings: list[Finding]) -> Answer:
+    async def synth(question: str, findings: list[Finding], provider: str) -> Answer:
+        calls.setdefault("providers", []).append(provider)
         calls["synth"] += 1
         return Answer(
             text=f"answer from {len(findings)} findings",
@@ -125,6 +128,25 @@ async def test_plan_research_synthesize_then_accept(env, research_worker, wf_id)
     assert answer.text == "answer from 4 findings"
     assert len(calls["research"]) == 4
     assert calls["synth"] == 1
+
+
+async def test_provider_is_durable_workflow_input(env, research_worker, wf_id):
+    acts, calls = _mocks(n_subs=2)
+    async with research_worker(acts):
+        # Exact web-tier shape: it deliberately starts by Workflow name and sends
+        # plain JSON so it never imports the research app or either provider SDK.
+        handle = await env.client.start_workflow(
+            "ResearchWorkflow",
+            {"question": "compare providers", "provider": "anthropic"},
+            id=wf_id,
+            task_queue=TASK_QUEUE,
+        )
+        state = await _wait_for_stage(handle, "awaiting_review")
+        await handle.signal("review", args=["accept", ""])
+        await handle.result()
+
+    assert state["provider"] == "anthropic"
+    assert set(calls["providers"]) == {"anthropic"}
 
 
 async def test_query_reports_progress_and_token_usage(env, research_worker, wf_id):
@@ -199,21 +221,21 @@ async def test_one_refused_subquestion_still_produces_a_report(
     calls: dict = {"research": []}
 
     @activity.defn(name="plan_research")
-    async def plan(question: str) -> ResearchPlan:
+    async def plan(question: str, provider: str) -> ResearchPlan:
         return ResearchPlan(
             sub_questions=[SubQuestion(index=i, text=f"sub {i}") for i in range(3)],
             usage=Usage(),
         )
 
     @activity.defn(name="research_subquestion")
-    async def research(sub: SubQuestion) -> Finding:
+    async def research(sub: SubQuestion, provider: str) -> Finding:
         calls["research"].append(sub.index)
         if sub.index == 1:
             raise ApplicationError("declined by safety classifiers", non_retryable=True)
         return Finding(index=sub.index, question=sub.text, summary=f"found {sub.index}")
 
     @activity.defn(name="synthesize")
-    async def synth(question: str, findings: list[Finding]) -> Answer:
+    async def synth(question: str, findings: list[Finding], provider: str) -> Answer:
         return Answer(text=f"report from {len(findings)}", sources=[])
 
     async with research_worker([plan, research, synth]):
@@ -239,18 +261,18 @@ async def test_every_subquestion_failing_fails_the_workflow(
     """
 
     @activity.defn(name="plan_research")
-    async def plan(question: str) -> ResearchPlan:
+    async def plan(question: str, provider: str) -> ResearchPlan:
         return ResearchPlan(
             sub_questions=[SubQuestion(index=i, text=f"sub {i}") for i in range(2)],
             usage=Usage(),
         )
 
     @activity.defn(name="research_subquestion")
-    async def research(sub: SubQuestion) -> Finding:
+    async def research(sub: SubQuestion, provider: str) -> Finding:
         raise ApplicationError("nope", non_retryable=True)
 
     @activity.defn(name="synthesize")
-    async def synth(question: str, findings: list[Finding]) -> Answer:
+    async def synth(question: str, findings: list[Finding], provider: str) -> Answer:
         raise AssertionError("synthesize must not be called with no findings")
 
     async with research_worker([plan, research, synth]):
@@ -541,15 +563,15 @@ async def test_a_permanently_failing_activity_fails_the_workflow(
     """Retries must be bounded, or one bad sub-question pins a pool instance."""
 
     @activity.defn(name="plan_research")
-    async def plan(question: str) -> ResearchPlan:
+    async def plan(question: str, provider: str) -> ResearchPlan:
         return ResearchPlan(sub_questions=[SubQuestion(index=0, text="sub")])
 
     @activity.defn(name="research_subquestion")
-    async def always_fails(sub: SubQuestion) -> Finding:
+    async def always_fails(sub: SubQuestion, provider: str) -> Finding:
         raise ApplicationError("permanent")
 
     @activity.defn(name="synthesize")
-    async def synth(question: str, findings: list[Finding]) -> Answer:
+    async def synth(question: str, findings: list[Finding], provider: str) -> Answer:
         return Answer(text="never reached")
 
     w = runtime.build_worker(

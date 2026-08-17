@@ -1,9 +1,10 @@
 # Research Fleet — Instructions for Coding Agents
 
-> **Gemini fork, 2026-08-12.** This copy replaces the original provider-specific
-> seam with the Google Gen AI SDK, Gemini 3.6 Flash, and Google Search grounding.
-> The upstream repository is reference-only and must not be used as a push target.
-> Provider-specific changes belong in this repository.
+> **Dual-provider revision, 2026-08-17.** Gemini 3.6 Flash + Google Search is the
+> UI default for the Wednesday demo. The original Claude path remains available in
+> the same deployment and retains `pause_turn`, `_resume_from`, ephemeral prompt
+> caching, and `MAX_PAUSE_RESUMES`. Provider selection is Workflow input from the UI,
+> not an environment switch, so it is durable and visible in Temporal history.
 
 > **Renamed 2026-07-29** from folder `builder-bot-poc`, prefix `builder-bot`, queue
 > `builder-queue`, image `builder-worker`. Anything still saying those is stale —
@@ -28,11 +29,11 @@ A Temporal **Serverless Worker on GCP Cloud Run**, running **two apps on one Tas
 Queue**:
 
 1. **`HelloWorkflow`** → `say_hello` (5s sleep). The **infrastructure smoke test**.
-   Needs no Gemini key, which is what keeps `make verify SCALE=1` usable for
+   Needs no model key, which is what keeps `make verify SCALE=1` usable for
    diagnosing scaling problems without spending tokens. Keep it.
 2. **`ResearchWorkflow`** → the real app (added 2026-07-29). A conference demo: the
    audience asks research questions from their phones, each question fans out into
-   parallel sub-questions researched with Gemini + server-side web search, and a
+   parallel sub-questions researched with Gemini or Claude server-side search, and a
    projector shows the live Serverless Workers count.
 
 The Worker runs in a Cloud Run Worker Pool that Temporal's Worker Controller
@@ -76,9 +77,10 @@ size, and it forced `sys.path` juggling in both Workers. Don't re-introduce
 
 The research app (rationale summarised below; longer notes live in the local-only `decisions/`):
 
-- ✅ `llm.py` — **the Gemini seam.** Imports no `temporalio` and must not: it stays
+- ✅ `llm.py` — **the provider seam.** Imports no `temporalio` and must not: it stays
   unit-testable without a server, and the retry story lives in exactly one place.
-  `HttpRetryOptions(attempts=1)` on purpose — Temporal is the only retry layer.
+  Gemini uses `HttpRetryOptions(attempts=1)` and Claude uses `max_retries=0` on
+  purpose — Temporal is the only Activity retry layer.
 - ✅ `research_activities.py` — `plan_research`, `research_subquestion` (the fan-out
   unit), `synthesize`. Heartbeats on a **timer** during long Gemini requests.
 - ✅ `research_workflow.py` — `ResearchWorkflow`, PINNED, fan-out → draft → **human
@@ -127,22 +129,19 @@ stack** — the names are baked into every resource — so don't do it casually;
 
 ## Verification status
 
-The Temporal/Cloud Run infrastructure observations below come from the upstream
-project's 2026-07 deployments. They remain useful evidence for the platform wiring,
-but they are not proof that this Gemini fork has been deployed.
+The Temporal/Cloud Run infrastructure observations below come from 2026-07/08
+deployments. The provider seam is covered by offline fakes; tests must never make a
+real model request.
 
-For the Gemini fork:
-
-- All 104 Python tests and all 10 Terraform tests pass locally. The provider seam
-  uses offline fakes; tests must never make a real Gemini request.
-- `llm.client()` is lazy. The hello app and `make verify SCALE=1` work without
-  `GEMINI_API_KEY`; the first research call fails with a clear `RuntimeError`.
+- Both provider clients are lazy. The hello app and `make verify SCALE=1` work
+  without either API key; only the selected provider's research call needs its key.
 - Google Search grounding is one atomic GenerateContent request. Timer heartbeats
   preserve liveness, but there is no partial model output to checkpoint. If scale-in
   kills that request, Temporal retries it from the beginning. Already completed
   sibling findings and the plan remain durable and are not rerun.
-- A real Gemini API research run and a fresh GCP deployment are still required before
-  adding latency, token, search-count, or cache-hit claims to this file.
+- Claude `pause_turn` boundaries do carry partial output in heartbeat details;
+  `_resume_from` uses that checkpoint on a later Activity attempt. The cap is
+  provider-specific: Gemini has no `MAX_PAUSE_RESUMES` loop.
 
 Local infrastructure smoke test after any change: one Workflow ≈5.3s and
 `starter.py --count 5 --watch` ≈25s. The serialization is deliberate:
@@ -345,7 +344,7 @@ app.** Private traffic reaches the Temporal VM at `10.10.0.10:7233` through the 
 while `generativelanguage.googleapis.com` goes out over Cloud Run's default internet
 egress. There is deliberately **no Cloud NAT** and none is needed. Switching this to `ALL_TRAFFIC`
 would route Gemini calls into a subnet with no NAT and break every research Activity
-while `make verify SCALE=1` — which needs no Gemini key — kept passing. That failure
+while `make verify SCALE=1` — which needs no model key — kept passing. That failure
 would look like a broken app, not a network change.
 
 ## Known constraints (don't "fix" these — they're intentional)
@@ -357,7 +356,7 @@ would look like a broken app, not a network change.
   `AUTO_UPGRADE`) — this is a hard Serverless Workers requirement, not
   optional boilerplate.
 - **The hello app is not a placeholder — it's the infrastructure smoke test.** It
-  needs no Gemini key, so `make verify SCALE=1` can diagnose a scaling problem
+  needs no model key, so `make verify SCALE=1` can diagnose a scaling problem
   without spending tokens. Don't delete it now the research app exists.
 - The 5s sleep is not arbitrary — it creates the backlog the WCI scales on.
   Don't "optimise" it away.
@@ -382,8 +381,12 @@ Research app (full reasoning in `decisions/05-research-agent.md`):
   `minimal`, `low`, `medium`, `high`) because it is the demo's latency knob.
 - **Keep `SYSTEM_RESEARCH` constant.** Gemini implicit caching benefits from common
   prefixes. Do not interpolate request-specific text into the system instruction.
-- **Google Search is a built-in server tool.** Do not add a local scraper or a
-  client-side tool loop unless the architecture is deliberately being changed.
+- **Both search tools are server-side.** Gemini uses Google Search grounding and
+  Claude uses Anthropic web search. Do not add a local scraper or client-side tool
+  loop unless the architecture is deliberately being changed.
+- **Provider choice is request-scoped Workflow input.** The UI defaults to Gemini.
+  Do not replace it with `RESEARCH_PROVIDER`; ambient configuration could switch a
+  retry or replay to a different model than the one recorded when the run started.
 - **No time-skipping is possible in tests.** The test server rejects Worker
   Versioning, which every Workflow here requires. Not a preference — a hard block.
 - **Don't deploy a new `BUILD_ID` while a Workflow is awaiting review.** Parked

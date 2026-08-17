@@ -3,9 +3,10 @@
 # silently rewrites the build.
 temporalio>=1.30.0,<2
 
-# The research app. google-genai is imported only by llm.py, and the client is
-# lazy, so the hello app still starts without a Gemini API key.
+# Both provider clients are lazy: the hello app starts with no model key, and a
+# research request needs only the key for the provider selected in the UI.
 google-genai>=2.6.0,<3
+anthropic>=0.116.0,<1
 
 # The web tier. Same image as the Worker — Cloud Run overrides the container
 # command to run uvicorn instead of the Worker, so there is one image to build

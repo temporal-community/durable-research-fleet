@@ -90,6 +90,14 @@ run "worker_pool_env_contract" {
     ]) == 1
     error_message = "pool must pass the configured Gemini model to the Worker"
   }
+
+  assert {
+    condition = length([
+      for e in google_cloud_run_v2_worker_pool.fleet.template[0].containers[0].env :
+      e if e.name == "ANTHROPIC_MODEL" && e.value == var.anthropic_model
+    ]) == 1
+    error_message = "pool must pass the configured Claude model to the Worker"
+  }
 }
 
 run "worker_pool_starts_empty_and_stays_private" {
@@ -310,7 +318,7 @@ run "the_web_tier_is_a_service_not_a_worker_pool" {
   }
 }
 
-run "the_gemini_key_never_lands_in_state" {
+run "provider_keys_never_land_in_state" {
   command = plan
 
   # Injected by reference, not by value. A `sensitive` variable would still be
@@ -324,6 +332,14 @@ run "the_gemini_key_never_lands_in_state" {
     error_message = "GEMINI_API_KEY must come from a secret_key_ref, never a plaintext value"
   }
 
+  assert {
+    condition = length([
+      for e in google_cloud_run_v2_worker_pool.fleet.template[0].containers[0].env :
+      e if e.name == "ANTHROPIC_API_KEY" && length(e.value_source) == 1
+    ]) == 1
+    error_message = "ANTHROPIC_API_KEY must come from a secret_key_ref, never a plaintext value"
+  }
+
   # No key supplied by default, so a clean apply works and the hello app (and
   # `make verify SCALE=1`) keeps passing without any Gemini credentials.
   assert {
@@ -331,10 +347,22 @@ run "the_gemini_key_never_lands_in_state" {
     error_message = "gemini_api_key must default to null; populate the secret out of band"
   }
 
+
+  assert {
+    condition     = var.anthropic_api_key == null
+    error_message = "anthropic_api_key must default to null; populate the secret out of band"
+  }
+
   # Only the Worker reads it. The web tier never calls Gemini.
   assert {
     condition     = google_secret_manager_secret_iam_member.worker_reads_gemini.member == "serviceAccount:${google_service_account.worker_rt.email}"
     error_message = "only the Worker runtime SA should be able to read the Gemini key"
+  }
+
+
+  assert {
+    condition     = google_secret_manager_secret_iam_member.worker_reads_anthropic.member == "serviceAccount:${google_service_account.worker_rt.email}"
+    error_message = "only the Worker runtime SA should be able to read the Anthropic key"
   }
 }
 
