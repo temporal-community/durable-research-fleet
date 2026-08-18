@@ -1,3 +1,5 @@
+# Durable Research Fleet
+
 <div align="center">
 
 [![Temporal](https://img.shields.io/badge/Temporal-Serverless%20Workers-141414?logo=temporal&logoColor=white)](https://temporal.io)
@@ -9,8 +11,6 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-orange)](LICENSE)
 
 </div>
-
-# Durable Research Fleet
 
 **Ask once. Watch a fleet appear, research in parallel, and disappear — while the Workflow stays alive.**
 
