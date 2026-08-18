@@ -18,12 +18,12 @@ terraform/.terraform/
 # Large locally-built CLI binaries (see `make cli`)
 bin/
 
-# Local secrets for Phase 0 development — ANTHROPIC_API_KEY lives here so it is
+# Local secrets for Phase 0 development — GEMINI_API_KEY lives here so it is
 # never a shell-history entry or a Terraform value. In production the key comes
 # from Secret Manager instead (terraform/secrets.tf).
 .env
 
 # Local working memory: why decisions were made, and what we already tried that
 # doesn't work. Deliberately not committed — it's session narrative and judgement
-# calls, not project documentation. CLAUDE.md points at it for future sessions.
+# calls, not project documentation. AGENTS.md points at it for future sessions.
 decisions/

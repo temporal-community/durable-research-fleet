@@ -4,10 +4,9 @@ The heartbeat tests are the important ones. On Cloud Run, scale-in is decided at
 the pool level and does not know which instance is mid-Activity, so these two
 properties are what stand between the demo and a silently-restarted research task:
 
-  - the heartbeat fires on a TIMER, not only between pause_turn rounds, so a
-    single long round is not mistaken for a dead Worker;
-  - the last heartbeat carries enough state that a retry continues instead of
-    starting from a blank page.
+  - the heartbeat fires on a TIMER while one long Gemini request is in flight;
+  - completed sibling Activities stay committed in Workflow history even if one
+    in-flight atomic request is interrupted and retried.
 """
 
 import asyncio
@@ -60,7 +59,7 @@ async def test_plan_research_returns_subquestions(stub_llm):
 
 async def test_plan_research_reports_its_own_token_spend(stub_llm):
     """REGRESSION. `plan_research` first returned a bare `list[SubQuestion]`, so the
-    planning call's tokens were discarded — one real Opus 5 call per question,
+    planning call's tokens were discarded — one real model call per question,
     invisible in the token counter. The first live run showed a completed plan with
     `tokens: 0`.
     """
@@ -126,14 +125,14 @@ async def test_planner_uses_a_schema_and_lower_effort(stub_llm):
 async def test_research_heartbeats_on_a_timer_during_one_long_call(
     monkeypatch, stub_llm
 ):
-    """The bug this guards: heartbeating only between pause_turn rounds means a
-    single round longer than heartbeat_timeout looks like a dead Worker, and a
+    """The bug this guards: failing to heartbeat during one long API request means a
+    request longer than heartbeat_timeout looks like a dead Worker, and a
     healthy Activity is killed and retried — burning the tokens it already spent.
     """
     monkeypatch.setattr(ra, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
 
     async def slow(**kw):
-        await asyncio.sleep(0.4)  # one round, no pause_turn
+        await asyncio.sleep(0.4)  # one atomic GenerateContent request
         return _result("done")
 
     stub_llm(slow)
@@ -148,9 +147,9 @@ async def test_research_heartbeats_on_a_timer_during_one_long_call(
     assert len(beats) >= 3, f"expected timer heartbeats during the call, got {beats}"
 
 
-async def test_research_records_a_checkpoint_when_cancelled(monkeypatch, stub_llm):
-    """Graceful shutdown cancels in-flight Activities. The freshest checkpoint has
-    to be recorded on the way out, or the retry starts from nothing.
+async def test_research_heartbeats_when_cancelled(monkeypatch, stub_llm):
+    """Graceful shutdown cancels in-flight Activities. A final heartbeat records
+    the interruption even though Gemini exposes no partial response to resume.
     """
     monkeypatch.setattr(ra, "HEARTBEAT_INTERVAL_SECONDS", 10)  # no timer beats
 
@@ -172,99 +171,94 @@ async def test_research_records_a_checkpoint_when_cancelled(monkeypatch, stub_ll
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    # Exactly the cancellation heartbeat — proof the checkpoint is written on the
-    # way out rather than lost with the process.
-    assert beats, "cancellation must record a final checkpoint"
+    assert beats, "cancellation must emit a final heartbeat"
 
 
-# --- research: resuming ----------------------------------------------------
+# --- research: provider-specific resume semantics --------------------------
 
 
-async def test_a_completed_round_populates_the_checkpoint(monkeypatch, stub_llm):
-    """REGRESSION. This is the bug a Phase 0 end-to-end run found and every unit
-    test missed.
-
-    `on_progress` originally received only the round *index*, so the checkpoint
-    carried a counter and no content. `resumed` is gated on `partial_summary` being
-    non-empty, which made it structurally always False — the resume prompt was never
-    built and the durability credit could never fire. Nothing failed; the feature
-    was simply inert.
-
-    The other resume tests inject a checkpoint directly, so they passed regardless.
-    This one asserts the checkpoint is PRODUCED.
-    """
-    monkeypatch.setattr(ra, "HEARTBEAT_INTERVAL_SECONDS", 30)  # no timer beats
+async def test_claude_pause_turn_populates_a_bounded_checkpoint(
+    monkeypatch, stub_llm
+):
+    monkeypatch.setattr(ra, "HEARTBEAT_INTERVAL_SECONDS", 30)
 
     async def two_rounds(**kw):
-        # Stand in for llm.complete crossing one pause_turn boundary.
         kw["on_progress"](
             llm.LLMResult(
-                text="partial finding from round one",
+                text="x" * 50_000,
                 usage=llm.Usage(input_tokens=700, output_tokens=300),
                 rounds=1,
             )
         )
-        return _result("complete finding", tokens=1000, rounds=2)
+        return _result("final", rounds=2)
 
-    stub_llm(two_rounds)
-
+    calls = stub_llm(two_rounds)
     beats = []
     env = ActivityEnvironment()
     env.on_heartbeat = lambda *a: beats.append(a[0])
 
-    await env.run(ra.research_subquestion, SubQuestion(index=0, text="q"))
+    await env.run(ra.research_subquestion, SubQuestion(0, "q"), "anthropic")
 
-    assert beats, "a completed round must heartbeat its checkpoint"
-    cp = beats[-1]
-    assert cp.partial_summary == "partial finding from round one"
-    assert cp.rounds_done == 1
-    assert cp.tokens_so_far == 1000
-
-
-async def test_checkpoint_text_is_bounded(monkeypatch, stub_llm):
-    """Heartbeat details ride every heartbeat, so the partial cannot be unbounded."""
-    monkeypatch.setattr(ra, "HEARTBEAT_INTERVAL_SECONDS", 30)
-
-    async def huge(**kw):
-        kw["on_progress"](llm.LLMResult(text="x" * 50_000, rounds=1))
-        return _result("done")
-
-    stub_llm(huge)
-
-    beats = []
-    env = ActivityEnvironment()
-    env.on_heartbeat = lambda *a: beats.append(a[0])
-    await env.run(ra.research_subquestion, SubQuestion(index=0, text="q"))
-
+    assert calls[0]["provider"] == "anthropic"
+    assert beats[-1].provider == "anthropic"
+    assert beats[-1].rounds_done == 1
+    assert beats[-1].tokens_so_far == 1000
     assert len(beats[-1].partial_summary) == ra.CHECKPOINT_SUMMARY_CHARS
 
 
-async def test_research_resumes_from_a_checkpoint(stub_llm):
-    """The Activity-level half of the durability win: a retry after a scale-in
-    interruption must extend the previous attempt's work, not repeat it.
-    """
+async def test_claude_retry_resumes_from_heartbeat_details(stub_llm):
     calls = stub_llm(lambda **kw: _result("final answer"))
-
     env = ActivityEnvironment()
     env.info = dataclasses.replace(
         env.info,
         attempt=2,
         heartbeat_details=[
-            {"rounds_done": 2, "partial_summary": "Austin inventory rose 12%.",
-             "tokens_so_far": 4321}
+            {
+                "provider": "anthropic",
+                "rounds_done": 2,
+                "partial_summary": "Austin inventory rose 12%.",
+                "tokens_so_far": 4321,
+            }
         ],
     )
 
-    finding = await env.run(ra.research_subquestion, SubQuestion(index=1, text="q"))
+    finding = await env.run(
+        ra.research_subquestion, SubQuestion(index=1, text="q"), "anthropic"
+    )
 
     assert finding.resumed is True
-    prompt = calls[0]["prompt"]
-    assert "Austin inventory rose 12%." in prompt
-    assert "interrupted" in prompt
-    assert "do not repeat searches" in prompt
+    assert "Austin inventory rose 12%." in calls[0]["prompt"]
+    assert "interrupted" in calls[0]["prompt"]
 
 
-async def test_research_without_a_checkpoint_is_not_marked_resumed(stub_llm):
+async def test_gemini_ignores_partial_checkpoint_because_the_call_is_atomic(stub_llm):
+    calls = stub_llm(lambda **kw: _result("answer"))
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(
+        env.info,
+        attempt=2,
+        heartbeat_details=[
+            {
+                "provider": "anthropic",
+                "partial_summary": "must not cross providers",
+            }
+        ],
+    )
+
+    finding = await env.run(
+        ra.research_subquestion, SubQuestion(index=0, text="q"), "gemini"
+    )
+
+    assert finding.resumed is False
+    assert "must not cross providers" not in calls[0]["prompt"]
+    assert calls[0]["on_progress"] is None
+
+
+# --- research: atomic Gemini response -------------------------------------
+
+
+async def test_research_is_not_marked_resumed(stub_llm):
+    """GenerateContent is atomic, so a finding never claims partial-call resume."""
     calls = stub_llm(lambda **kw: _result("answer"))
     finding = await ActivityEnvironment().run(
         ra.research_subquestion, SubQuestion(index=0, text="the question")
@@ -272,35 +266,6 @@ async def test_research_without_a_checkpoint_is_not_marked_resumed(stub_llm):
     assert finding.resumed is False
     assert "interrupted" not in calls[0]["prompt"]
     assert "the question" in calls[0]["prompt"]
-
-
-async def test_resume_from_decodes_an_untyped_dict():
-    """Heartbeat details come back WITHOUT type information, so a dataclass arrives
-    as a plain dict. Assuming it arrives as a Checkpoint silently disables resume —
-    no error, the retry just starts from a blank page.
-    """
-
-    async def probe() -> Checkpoint | None:
-        return ra._resume_from()
-
-    env = ActivityEnvironment()
-    env.info = dataclasses.replace(
-        env.info,
-        heartbeat_details=[
-            {"rounds_done": 3, "partial_summary": "partial text", "tokens_so_far": 99}
-        ],
-    )
-    cp = await env.run(probe)
-
-    assert isinstance(cp, Checkpoint)
-    assert (cp.rounds_done, cp.partial_summary, cp.tokens_so_far) == (3, "partial text", 99)
-
-
-async def test_resume_from_is_none_on_a_first_attempt():
-    async def probe() -> Checkpoint | None:
-        return ra._resume_from()
-
-    assert await ActivityEnvironment().run(probe) is None
 
 
 # --- research: the fan-out unit carries usage through ---------------------
@@ -331,9 +296,9 @@ async def test_research_declares_web_search_and_a_tunable_effort(stub_llm):
     """
     calls = stub_llm(lambda **kw: _result())
     await ActivityEnvironment().run(ra.research_subquestion, SubQuestion(0, "q"))
-    assert calls[0]["tools"] == [llm.WEB_SEARCH_TOOL]
+    assert calls[0]["web_search"] is True
     assert calls[0]["effort"] == ra.RESEARCH_EFFORT
-    assert ra.RESEARCH_EFFORT in ("low", "medium", "high", "xhigh", "max")
+    assert ra.RESEARCH_EFFORT in ("minimal", "low", "medium", "high")
 
 
 # --- synthesis -------------------------------------------------------------
@@ -461,28 +426,17 @@ def test_synthesis_prompt_asks_for_sections_and_citations():
     assert "bibliography" in s.lower(), "the app renders sources; the model must not"
 
 
-def test_research_prompt_is_cacheable():
-    """Opus 5 will not cache a prefix under 512 tokens, and it fails SILENTLY —
-    cache_creation_input_tokens simply stays 0. With ~120 concurrent sub-questions
-    in a burst this prompt is the biggest cost lever in the app, so its length is
-    functional and must not be trimmed for tidiness.
-
-    Guarded on characters because tokenising needs an API call. ~4.2 chars/token is
-    a pessimistic ratio for English prose, so this floor is conservative.
-    """
-    text = ra.SYSTEM_RESEARCH[0]["text"]
-    assert ra.SYSTEM_RESEARCH[0]["cache_control"] == {"type": "ephemeral"}
-    assert len(text) / 4.2 > 512, (
-        f"research system prompt is ~{len(text) / 4.2:.0f} tokens, under Opus 5's "
-        "512-token cache floor — caching would silently never engage"
-    )
+def test_research_prompt_uses_no_provider_specific_cache_marker():
+    """Gemini implicit caching needs a common prefix, not a manual cache marker."""
+    assert isinstance(ra.SYSTEM_RESEARCH, str)
+    assert "cache_control" not in ra.SYSTEM_RESEARCH
 
 
 def test_research_prompt_is_a_constant_not_interpolated():
     """Any per-request variation in the prefix invalidates the cache for every
     later sub-question in the burst.
     """
-    text = ra.SYSTEM_RESEARCH[0]["text"]
+    text = ra.SYSTEM_RESEARCH
     assert "{" not in text and "%s" not in text
 
 
@@ -503,26 +457,22 @@ def test_the_timeout_budget_closes():
     """REGRESSION. The first live run failed with four consecutive APITimeoutErrors
     because the 120s HTTP timeout was far too tight for server-side web search.
 
-    Checking `HTTP_TIMEOUT < start_to_close` was not enough: `llm.complete` makes up
-    to MAX_PAUSE_RESUMES + 1 calls for ONE Activity, so the budget that has to close
-    is the WHOLE chain against start_to_close. Otherwise a slow-but-healthy call is
-    killed by the Activity timeout instead of surfacing as a retryable failure — and
-    the difference matters, because the Activity timeout path throws away the
-    heartbeat checkpoint's usefulness.
+    The Gemini seam makes one atomic call, so its per-request timeout must stay below
+    the Activity's start_to_close budget. Otherwise a slow-but-healthy request is
+    killed by the Activity timeout instead of surfacing as a retryable failure.
     """
     import research_workflow as rw
 
-    rounds = llm.MAX_PAUSE_RESUMES + 1
-    worst_case = rounds * llm.HTTP_TIMEOUT_SECONDS
-    assert worst_case < rw.RESEARCH_START_TO_CLOSE_SECONDS, (
-        f"{rounds} rounds x {llm.HTTP_TIMEOUT_SECONDS}s = {worst_case}s exceeds "
-        f"start_to_close {rw.RESEARCH_START_TO_CLOSE_SECONDS}s"
+    assert llm.HTTP_TIMEOUT_SECONDS < rw.RESEARCH_START_TO_CLOSE_SECONDS
+    assert (
+        (llm.MAX_PAUSE_RESUMES + 1) * llm.ANTHROPIC_HTTP_TIMEOUT_SECONDS
+        < rw.RESEARCH_START_TO_CLOSE_SECONDS
     )
 
 
 def test_http_timeout_is_generous_enough_for_web_search():
-    """Web search is not a fast tool: Claude issues queries, fetches pages and
-    filters them inside one request. 120s was measured to be too short.
+    """Google Search grounding can issue queries and fetch sources inside one
+    request. The original 120s ceiling was measured to be too short.
     """
     assert llm.HTTP_TIMEOUT_SECONDS >= 240
 

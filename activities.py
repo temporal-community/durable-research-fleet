@@ -1,6 +1,6 @@
 """The hello app's Activity — the infrastructure smoke test.
 
-Needs no Claude key, which is what keeps `make verify SCALE=1` usable for
+Needs no Gemini key, which is what keeps `make verify SCALE=1` usable for
 diagnosing scaling without spending tokens.
 """
 

@@ -283,7 +283,7 @@ clause. Config changes apply live, no restart needed.
 - Give the Temporal Service a GCP identity (ADC on GCE/GKE, or Workload Identity Federation outside GCP)
 - Create the invoker service account: Temporal's GCP identity gets
   `roles/iam.serviceAccountTokenCreator` on it; the invoker gets a Cloud Run
-  role with at least `run.workerPools.get` + `run.workerPools.update`
+  role with at least `run.workerpools.get` + `run.workerpools.update`
   (`roles/run.developer` covers both)
 - **⚠️ The docs' IAM list above is INCOMPLETE — verified 2026-07-28.** The invoker
   also needs **`iam.serviceAccounts.actAs` on the Worker Pool's *runtime*
@@ -527,7 +527,7 @@ ideation for later.
 ```
 research-fleet/
 ├── README.md             # start here — file map + local quickstart
-├── CLAUDE.md             # context for Claude Code (must stay at root to load)
+├── AGENTS.md              # coding-agent instructions (must stay at repo root)
 ├── workflows.py          # HelloWorkflow (PINNED)
 ├── activities.py         # say_hello — one 5s Activity
 ├── starter.py            # starts Workflows

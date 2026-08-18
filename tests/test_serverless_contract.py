@@ -23,6 +23,19 @@ import workflows
 APP_MODULES = [workflows, research_workflow]
 
 
+def test_cli_build_pins_cloud_run_field_mask_fix():
+    """The CLI's July scaler dependency sent a camelCase gRPC field mask.
+
+    Cloud Run accepted UpdateWorkerPool but silently ignored the requested count,
+    so the WCI believed it had scaled while the pool stayed at zero. Keep the
+    upstream revision containing the snake_case mask fix pinned until CLI main
+    advances past it.
+    """
+    makefile = pathlib.Path("Makefile").read_text()
+    assert "v0.0.0-20260811170210-91f6fe1d10ab" in makefile
+    assert "go get go.temporal.io/auto-scaled-workers@$(AUTO_SCALED_WORKERS_VERSION)" in makefile
+
+
 # --- KB §5: Worker Versioning is mandatory ---------------------------------
 
 
@@ -48,7 +61,7 @@ def test_every_workflow_declares_a_versioning_behavior(module):
 
 def test_both_apps_are_registered_on_the_pool():
     """The hello app is the infrastructure smoke test and must stay registered: it
-    is the only path `make verify SCALE=1` can exercise without a Claude key.
+    is the only path `make verify SCALE=1` can exercise without either model key.
     """
     for path in ("worker_cloudrun.py", "worker_local.py"):
         src = open(path).read()
@@ -102,23 +115,20 @@ def test_long_activities_heartbeat_on_a_timer_not_only_between_rounds():
     """KB §7.3, sharpened for LLM Activities.
 
     The hello Activity can heartbeat inside its own sleep loop. A research Activity
-    awaits a single API call that may run for a minute or more, so heartbeating only
-    at `pause_turn` boundaries would let a healthy Activity exceed heartbeat_timeout
-    and be killed — losing the tokens it had already spent, which is precisely the
-    failure this demo argues against.
+    awaits a single API call that may run for a minute or more, so it must heartbeat
+    while that call is in flight or a healthy Activity can exceed heartbeat_timeout
+    and be killed.
     """
     assert "_heartbeating" in inspect.getsource(research_activities.research_subquestion)
     src = inspect.getsource(research_activities._heartbeating)
     assert "asyncio.sleep(interval)" in src and "activity.heartbeat" in src
 
 
-def test_long_activities_checkpoint_for_resume():
-    """KB §7.3. A heartbeat that carries no progress lets the retry restart from a
-    blank page; the whole point is that it resumes.
+def test_long_activities_record_cancellation_before_retry():
+    """KB §7.3. Cancellation must heartbeat so Temporal can retry promptly and,
+    for Claude, retain the latest completed pause_turn checkpoint.
     """
     src = inspect.getsource(research_activities.research_subquestion)
-    assert "_resume_from()" in src
-    # And the checkpoint must be recorded on the way out when scale-in cancels it.
     assert "CancelledError" in src and "activity.heartbeat(state)" in src
 
 
@@ -249,10 +259,10 @@ def test_runtime_is_app_agnostic():
 
 
 def test_the_web_tier_does_not_import_the_research_app():
-    """`web.py` runs in the same image but must not pull in the Claude SDK.
+    """`web.py` runs in the same image but must not pull in either model SDK.
 
     It starts, queries and signals Workflows by NAME, so the request-serving process
-    needs no ANTHROPIC_API_KEY and no shared types to keep in sync. An import here
+    needs no GEMINI_API_KEY and no shared types to keep in sync. An import here
     would couple the two tiers for no benefit.
     """
     import ast
@@ -266,6 +276,7 @@ def test_the_web_tier_does_not_import_the_research_app():
             imported.add(node.module.split(".")[0])
 
     leaked = imported & {
+        "google",
         "anthropic",
         "llm",
         "research_workflow",
@@ -297,13 +308,13 @@ def test_the_llm_seam_does_not_import_temporal():
 
 def test_only_temporal_retries():
     """Two retry layers multiply into latency nobody can reason about, and a
-    hand-rolled one is the thing this demo argues against. The Anthropic client runs
-    with max_retries=0 and the Activity's RetryPolicy owns recovery — which means the
-    policy has to be able to ride out a 429 on its own.
+    hand-rolled one is the thing this demo argues against. Both clients disable SDK
+    retries and the Activity's RetryPolicy owns recovery, including 429s.
     """
     import llm
 
-    assert "max_retries=0" in inspect.getsource(llm.client)
+    assert "HttpRetryOptions(attempts=1)" in inspect.getsource(llm.client)
+    assert "max_retries=0" in inspect.getsource(llm.anthropic_client)
     policy = research_workflow.RESEARCH_RETRY
     assert policy.maximum_interval.total_seconds() >= 60
     assert policy.maximum_attempts >= 5

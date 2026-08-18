@@ -4,8 +4,9 @@ Runs on a Cloud Run **Service**, not a Worker Pool: it is a Temporal *client* th
 starts Workflows, reads Queries and sends Signals. Same image as the Worker, with
 the command overridden to uvicorn.
 
-MUST NOT import `research_workflow`, `llm` or `anthropic`. Workflows are started,
-queried and signalled by NAME STRING so the web process needs no Claude key.
+MUST NOT import `research_workflow`, `llm`, `google.genai` or `anthropic`. Workflows
+are started, queried and signalled by NAME STRING so the web process needs no model
+key.
 Enforced by tests/test_serverless_contract.py.
 
 The Serverless Workers count is `DescribeTaskQueue` poller identities — one Worker
@@ -55,6 +56,8 @@ ASKS_PER_MINUTE_PER_IP = 3
 # CASE-INSENSITIVE on purpose: phone keyboards auto-capitalise the first letter, so a
 # case-sensitive check rejects most of the room on their first try.
 DEMO_PASSCODE = os.environ.get("DEMO_PASSCODE", "").strip()
+DEFAULT_PROVIDER = "gemini"
+PROVIDERS = frozenset({"gemini", "anthropic"})
 
 
 def _passcode_ok(supplied: str | None) -> bool:
@@ -162,6 +165,7 @@ def _rate_limited(ip: str) -> bool:
 async def ask(request: Request) -> dict:
     body = await request.json()
     question = (body.get("question") or "").strip()
+    provider = (body.get("provider") or DEFAULT_PROVIDER).strip().lower()
 
     if not _passcode_ok(body.get("passcode")):
         raise HTTPException(status_code=403, detail="Wrong passcode.")
@@ -172,6 +176,8 @@ async def ask(request: Request) -> dict:
             status_code=400,
             detail=f"Keep it under {MAX_QUESTION_CHARS} characters.",
         )
+    if provider not in PROVIDERS:
+        raise HTTPException(status_code=400, detail="Choose Gemini or Claude.")
 
     if _rate_limited(_client_ip(request)):
         raise HTTPException(
@@ -182,10 +188,13 @@ async def ask(request: Request) -> dict:
     workflow_id = f"research-{uuid.uuid4().hex[:10]}"
     # Started by NAME so this module never imports the research app.
     await client.start_workflow(
-        WORKFLOW_NAME, question, id=workflow_id, task_queue=TASK_QUEUE
+        WORKFLOW_NAME,
+        {"question": question, "provider": provider},
+        id=workflow_id,
+        task_queue=TASK_QUEUE,
     )
-    logger.info("started %s: %r", workflow_id, question[:80])
-    return {"id": workflow_id}
+    logger.info("started %s with %s: %r", workflow_id, provider, question[:80])
+    return {"id": workflow_id, "provider": provider}
 
 
 @app.get("/api/run/{workflow_id}")
@@ -221,7 +230,7 @@ async def decide(workflow_id: str, request: Request) -> dict:
 
     Guarded exactly like `/api/ask`, because it spends exactly like `/api/ask`: a
     `refine` decision starts a SECOND fan-out. Without these two checks, knowing a run
-    id was enough to spend Claude tokens repeatedly, bypassing both the passcode and
+    id was enough to spend Gemini tokens repeatedly, bypassing both the passcode and
     the per-IP limit. Run ids are `research-<uuid4[:10]>` and there is no listing
     endpoint, so they are not enumerable — but they are on screen in front of a room.
     """

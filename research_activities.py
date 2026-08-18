@@ -1,18 +1,14 @@
 """The research Activities — the app layer. `runtime.py` is untouched by this file.
 
     plan_research        one call, JSON-schema constrained      ~15s
-    research_subquestion one call + server-side web search   1-5 min   <- fans out
+    research_subquestion provider server-side web search    1-5 min   <- fans out
     synthesize           one call over the collected findings   ~1 min
 
-Those durations are MEASURED, and they are why the timeouts look generous: server-side
-web search fetches and filters pages inside one HTTP request. A 120s ceiling produced
-four consecutive APITimeoutErrors on the first live run.
-
-The heartbeat runs on a TIMER, not between `pause_turn` rounds. One round can exceed
-`heartbeat_timeout`, and the server cannot tell "still thinking" from "instance scaled
-away" — so a healthy Activity got timed out and retried, burning tokens already spent.
-The timer also means the last heartbeat holds partial research for the retry to
-continue from.
+Those durations are measured from the original implementation, and they are why the
+timeouts remain generous. The heartbeat runs on a timer while a provider request is
+in flight, so the server can distinguish "still working" from "instance scaled away".
+Gemini returns atomically; Claude can additionally checkpoint at ``pause_turn``
+boundaries. Completed sibling findings remain durable in both modes.
 """
 
 from __future__ import annotations
@@ -48,13 +44,12 @@ HEARTBEAT_INTERVAL_SECONDS = 15.0
 MAX_SUBQUESTIONS = max(1, int(os.environ.get("MAX_SUBQUESTIONS", "6")))
 MIN_SUBQUESTIONS = min(3, MAX_SUBQUESTIONS)
 
-# Cap on the partial text carried in a heartbeat. Heartbeat details ride every
-# heartbeat, so this is not a place to park an unbounded string.
-CHECKPOINT_SUMMARY_CHARS = 4_000
-
 # How many sources the final answer carries. A measured run consulted 436 unique
 # pages; showing them all buries the answer on a phone screen.
 MAX_SOURCES_SHOWN = 25
+
+# Heartbeat details ride every heartbeat, so partial Claude output is bounded.
+CHECKPOINT_SUMMARY_CHARS = 4_000
 
 # The demo's latency knob, and an env var so it is tunable on the day with no
 # rebuild. `high` ran a single sub-question past the original 120s timeout.
@@ -70,15 +65,10 @@ SYNTHESIS_EFFORT = os.environ.get("SYNTHESIS_EFFORT", "high").strip()
 # Prompts
 # --------------------------------------------------------------------------
 
-# Byte-identical across every sub-question in a burst so the rest read it from cache
-# at ~0.1x input price — the biggest cost lever here. Never interpolate into it.
-# LENGTH IS FUNCTIONAL: Opus 5 silently stops caching a prefix under 512 tokens
-# (cache_creation_input_tokens just stays 0). Guarded by
-# `test_research_prompt_is_cacheable`. Do not trim for tidiness.
-SYSTEM_RESEARCH = [
-    {
-        "type": "text",
-        "text": """You are a research analyst working on one narrow sub-question that forms part of a larger investigation. Another analyst will combine your answer with several others, so your job is depth on your specific sub-question rather than breadth across the whole topic. Do not try to answer the broader question you can infer around it.
+# Byte-identical across every sub-question in a burst. Gemini benefits from implicit
+# caching. The Claude adapter adds its ephemeral marker at the provider boundary, so
+# no provider-specific object belongs in this shared prompt. Never interpolate.
+SYSTEM_RESEARCH = """You are a research analyst working on one narrow sub-question that forms part of a larger investigation. Another analyst will combine your answer with several others, so your job is depth on your specific sub-question rather than breadth across the whole topic. Do not try to answer the broader question you can infer around it.
 
 Method:
 - Search the web before you answer. Do not answer from memory, even when you are confident: your training data may be stale, and the entire point of this task is current information.
@@ -99,11 +89,7 @@ Output:
 - Lead with the answer to the sub-question in your first sentence. Supporting evidence, figures and caveats come after it.
 - Attach concrete specifics wherever you have them: numbers, dates, named organisations, named places. Vague summary is the failure mode to avoid.
 - Do not pad to reach the word count. If the honest answer is short, keep it short.
-- Never invent a statistic, a quotation, a date, or a source. If you did not find it, say you did not find it.""",
-        # Cache the prefix. See the comment above.
-        "cache_control": {"type": "ephemeral"},
-    }
-]
+- Never invent a statistic, a quotation, a date, or a source. If you did not find it, say you did not find it."""
 
 SYSTEM_PLAN = """You break a research question into independent sub-questions that can be investigated in parallel.
 
@@ -172,25 +158,31 @@ async def _heartbeating(state: Checkpoint, interval: float | None = None):
             await task
 
 
-def _resume_from() -> Checkpoint | None:
-    """The checkpoint from a previous attempt, if this is a retry.
+def _resume_from(provider: str) -> Checkpoint | None:
+    """Read Claude's last completed pause_turn checkpoint on an Activity retry.
 
-    Heartbeat details come back without type information, so a dataclass arrives
-    as a plain dict — handle both rather than assuming.
+    Gemini heartbeats contain liveness only and are deliberately ignored: an atomic
+    grounded request has no partial model/tool state that can be resumed.
     """
+    if provider != "anthropic":
+        return None
     details = activity.info().heartbeat_details
     if not details:
         return None
     raw = details[-1]
     if isinstance(raw, Checkpoint):
-        return raw
-    if isinstance(raw, dict):
-        return Checkpoint(
+        checkpoint = raw
+    elif isinstance(raw, dict):
+        checkpoint = Checkpoint(
+            phase=raw.get("phase", "model_call") or "model_call",
+            provider=raw.get("provider", "anthropic") or "anthropic",
             rounds_done=raw.get("rounds_done", 0) or 0,
             partial_summary=raw.get("partial_summary", "") or "",
             tokens_so_far=raw.get("tokens_so_far", 0) or 0,
         )
-    return None
+    else:
+        return None
+    return checkpoint if checkpoint.provider in ("", "anthropic") else None
 
 
 # --------------------------------------------------------------------------
@@ -199,11 +191,13 @@ def _resume_from() -> Checkpoint | None:
 
 
 @activity.defn
-async def plan_research(question: str) -> ResearchPlan:
+async def plan_research(
+    question: str, provider: str = llm.DEFAULT_PROVIDER
+) -> ResearchPlan:
     """Split the question into independent, parallel-researchable sub-questions.
 
     Returns the plan AND its usage. Returning a bare list dropped the planning
-    spend — one Opus 5 call per question, missing from the cost counter.
+    spend — one model call per question, missing from the token counter.
     """
     schema: dict[str, Any] = {
         "type": "object",
@@ -217,9 +211,11 @@ async def plan_research(question: str) -> ResearchPlan:
         "additionalProperties": False,
     }
 
-    state = Checkpoint()
+    provider = llm.normalize_provider(provider)
+    state = Checkpoint(provider=provider)
     async with _heartbeating(state):
         result = await llm.complete(
+            provider=provider,
             system=SYSTEM_PLAN,
             prompt=(
                 f"Research question:\n\n{question}\n\n"
@@ -249,49 +245,40 @@ async def plan_research(question: str) -> ResearchPlan:
 
 
 @activity.defn
-async def research_subquestion(sub: SubQuestion) -> Finding:
-    """Research one sub-question with server-side web search.
+async def research_subquestion(
+    sub: SubQuestion, provider: str = llm.DEFAULT_PROVIDER
+) -> Finding:
+    """Research one sub-question with the selected provider's server-side search.
 
     The fan-out unit: N of these hit the Task Queue at once, N-1 fail to sync-match
     against the current pool, and the Worker Controller scales up to meet them.
     """
-    resume = _resume_from()
+    provider = llm.normalize_provider(provider)
+    resume = _resume_from(provider)
     state = Checkpoint(
+        provider=provider,
         rounds_done=resume.rounds_done if resume else 0,
         partial_summary=resume.partial_summary if resume else "",
         tokens_so_far=resume.tokens_so_far if resume else 0,
     )
-
     prompt = f"Sub-question:\n\n{sub.text}"
     if resume and resume.partial_summary:
-        # A previous attempt was interrupted — almost certainly by pool-level
-        # scale-in. Hand back what it had already established so this attempt
-        # extends it instead of re-running the same searches.
         activity.logger.info(
-            "resuming sub-question %d from checkpoint (%d rounds, %d tokens already spent)",
+            "resuming Claude sub-question %d from checkpoint (%d rounds, %d tokens)",
             sub.index,
             resume.rounds_done,
             resume.tokens_so_far,
         )
         prompt += (
-            "\n\nA previous attempt at this sub-question was interrupted before it "
-            "finished. Here is what it had already established:\n\n"
+            "\n\nA previous attempt was interrupted after a completed research "
+            "round. Here is what it had already established:\n\n"
             f"{resume.partial_summary}\n\n"
-            "Continue from there. Verify anything that looks shaky, fill the gaps, "
-            "and return the complete answer — but do not repeat searches whose "
-            "results are already reflected above."
+            "Continue from there. Verify anything shaky, fill the gaps, and return "
+            "the complete answer without repeating searches already reflected above."
         )
 
     def checkpoint(partial: llm.LLMResult) -> None:
-        """Record a completed research round so a retry can continue from it.
-
-        Called at each `pause_turn` boundary. Writing the actual partial text here
-        — not just a round counter — is what makes `resumed` meaningful and what
-        the durability credit is computed from.
-
-        Bounded, because heartbeat details ride every heartbeat and this is not a
-        place to park an unbounded string.
-        """
+        """Persist a completed Claude pause_turn round for a later Activity attempt."""
         state.rounds_done = partial.rounds
         state.partial_summary = partial.text.strip()[:CHECKPOINT_SUMMARY_CHARS]
         state.tokens_so_far = partial.usage.total_tokens
@@ -300,20 +287,23 @@ async def research_subquestion(sub: SubQuestion) -> Finding:
     try:
         async with _heartbeating(state):
             result = await llm.complete(
+                provider=provider,
                 system=SYSTEM_RESEARCH,
                 prompt=prompt,
-                tools=[llm.WEB_SEARCH_TOOL],
+                web_search=True,
+                cache_system=True,
                 max_tokens=16_000,
                 effort=RESEARCH_EFFORT,
-                on_progress=checkpoint,
+                on_progress=checkpoint if provider == "anthropic" else None,
             )
     except asyncio.CancelledError:
-        # Graceful shutdown during scale-in cancels in-flight Activities. Record
-        # the freshest checkpoint on the way out so the retry — which will land on
-        # a different instance — starts from here rather than from nothing.
+        # Graceful shutdown during scale-in cancels in-flight Activities. Emit one
+        # final heartbeat so Temporal detects the lost attempt promptly. For Claude
+        # it carries the latest pause_turn; Gemini carries liveness only.
         activity.heartbeat(state)
         activity.logger.warning(
-            "sub-question %d cancelled mid-flight; checkpoint recorded", sub.index
+            "sub-question %d cancelled mid-flight; checkpoint recorded",
+            sub.index,
         )
         raise
 
@@ -331,7 +321,11 @@ async def research_subquestion(sub: SubQuestion) -> Finding:
 
 
 @activity.defn
-async def synthesize(question: str, findings: list[Finding]) -> Answer:
+async def synthesize(
+    question: str,
+    findings: list[Finding],
+    provider: str = llm.DEFAULT_PROVIDER,
+) -> Answer:
     """Combine the findings into one report that CITES the sources by number.
 
     Order matters here, and it is the whole reason this function is shaped this way.
@@ -378,9 +372,11 @@ async def synthesize(question: str, findings: list[Finding]) -> Answer:
 
     prompt = "".join(parts)
 
-    state = Checkpoint()
+    provider = llm.normalize_provider(provider)
+    state = Checkpoint(provider=provider)
     async with _heartbeating(state):
         result = await llm.complete(
+            provider=provider,
             system=SYSTEM_SYNTHESIS,
             prompt=prompt,
             max_tokens=16_000,

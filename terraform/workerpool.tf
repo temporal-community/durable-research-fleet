@@ -82,7 +82,15 @@ resource "google_cloud_run_v2_worker_pool" "fleet" {
         value = var.research_effort
       }
       env {
-        # The research app's Claude key, injected from Secret Manager rather than
+        name  = "GEMINI_MODEL"
+        value = var.gemini_model
+      }
+      env {
+        name  = "ANTHROPIC_MODEL"
+        value = var.anthropic_model
+      }
+      env {
+        # The research app's Gemini key, injected from Secret Manager rather than
         # a plaintext value so it never lands in Terraform state.
         #
         # The hello app does not read this, which is what keeps
@@ -97,9 +105,21 @@ resource "google_cloud_run_v2_worker_pool" "fleet" {
         #   was not found
         #
         # So a version must exist BEFORE the pool is created. `make secret` seeds
-        # one (the real key, or a placeholder when ANTHROPIC_API_KEY is unset) and
+        # one (the real key, or a placeholder when GEMINI_API_KEY is unset) and
         # `make up` runs it before this apply. Do not assume an empty secret is a
         # tolerable state — it makes the pool uncreatable.
+        name = "GEMINI_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.gemini.secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        # Optional Claude mode is selected per Workflow in the UI, so the same pool
+        # needs access to this second key. `make secret` guarantees a version exists;
+        # it may be a placeholder until Claude mode is actually used.
         name = "ANTHROPIC_API_KEY"
         value_source {
           secret_key_ref {
@@ -146,6 +166,7 @@ resource "google_cloud_run_v2_worker_pool" "fleet" {
     google_artifact_registry_repository_iam_member.worker_rt_reader,
     # Without the accessor binding first, the pool's containers fail to start with
     # a secret-access error rather than a useful message.
+    google_secret_manager_secret_iam_member.worker_reads_gemini,
     google_secret_manager_secret_iam_member.worker_reads_anthropic,
     # Puts the pool downstream of the sleep, so teardown is:
     # pool -> brief wait -> subnet (see time_sleep.vpc_release for the caveat).

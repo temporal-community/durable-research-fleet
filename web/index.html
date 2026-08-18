@@ -45,6 +45,14 @@
         aria-label="Passcode" placeholder="Passcode from the stage">
     </div>
 
+    <label class="provider-pick" for="provider">
+      <span class="label">research with</span>
+      <select id="provider" aria-label="Research provider">
+        <option value="gemini" selected>Gemini + Google Search</option>
+        <option value="anthropic">Claude + Web Search</option>
+      </select>
+    </label>
+
     <div class="row" style="margin-top:.85rem">
       <button id="go">Research it</button>
       <span class="hint">⌘↵ to send</span>
@@ -102,6 +110,7 @@
       <div class="stage-line">
         <span class="pulse" id="stageDot" aria-hidden="true"></span>
         <span class="label" id="stage">starting</span>
+        <span class="label provider-badge" id="providerBadge"></span>
         <span class="label num" id="elapsed"></span>
       </div>
 
@@ -480,6 +489,7 @@ function revealPass(message) {
 
 async function ask() {
   const question = $('q').value.trim();
+  const provider = $('provider').value;
   $('askErr').textContent = '';
   if (!question) { $('askErr').textContent = 'Type a question first.'; return; }
 
@@ -489,7 +499,7 @@ async function ask() {
     const res = await fetch('/api/ask', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ question, passcode: passcode() }),
+      body: JSON.stringify({ question, provider, passcode: passcode() }),
     });
     const body = await res.json();
     if (!res.ok) throw new Error(body.detail || 'Could not start.');
@@ -499,6 +509,7 @@ async function ask() {
     startedAt = Date.now();
     history.replaceState({}, '', '/r/' + runId);
     $('qtitle').textContent = question;
+    $('providerBadge').textContent = provider;
     $('qtitle').classList.toggle('long', question.length > 120);
     morph(() => { document.body.dataset.state = 'running'; });
     beginRun();
@@ -592,6 +603,7 @@ async function pollRun() {
     $('qtitle').textContent = s.question;
     $('qtitle').classList.toggle('long', s.question.length > 120);
   }
+  if (s.provider) $('providerBadge').textContent = s.provider;
   $('stage').textContent = STAGES[s.stage] || s.stage;
   $('stageDot').className = 'pulse' +
     (s.stage === 'done' || s.stage === 'awaiting_review' ? '' : ' hot');

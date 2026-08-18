@@ -77,10 +77,40 @@ gcloud iam service-accounts get-iam-policy "$INVOKER" --project "$PROJECT" --for
   | grep -q 'roles/iam.serviceAccountTokenCreator' \
   && ok "VM can impersonate the invoker" || bad "VM cannot impersonate the invoker"
 
-gcloud projects get-iam-policy "$PROJECT" --flatten='bindings[].members' \
-  --filter="bindings.members:$INVOKER" --format='value(bindings.role)' 2>/dev/null \
-  | grep -q 'roles/run.developer' \
-  && ok "invoker has run.developer" || bad "invoker missing run.developer"
+# The docs say run.developer "or equivalent", and this stack grants the equivalent: a
+# custom role holding exactly run.workerpools.get + update. Check for the two VERBS
+# rather than for that role's name, because a stack deployed straight from the upstream
+# docs carries the predefined roles/run.developer and is not broken — asserting the
+# literal `projects/$PROJECT/roles/workerPoolScaler` would report a working stack as
+# failing. What has to be true is that the invoker can get and update Worker Pools; §8
+# below is the end-to-end proof that whatever is granted actually scales the pool.
+invoker_roles=$(gcloud projects get-iam-policy "$PROJECT" --flatten='bindings[].members' \
+  --filter="bindings.members:$INVOKER" --format='value(bindings.role)' 2>/dev/null)
+
+scaler_perms=""
+for role in $invoker_roles; do
+  # Custom roles come back as projects/<p>/roles/<id> and need --project to describe;
+  # predefined ones come back as roles/<id> and must not have it.
+  case "$role" in
+    */roles/*) desc_flag="--project=$PROJECT"; role_id="${role##*/roles/}" ;;
+    *)         desc_flag="";                   role_id="$role" ;;
+  esac
+  scaler_perms="$scaler_perms $(gcloud iam roles describe "$role_id" $desc_flag \
+    --format='value(includedPermissions)' 2>/dev/null | tr ';' ' ')"
+done
+
+case "$scaler_perms" in
+  *run.workerpools.get*) has_get=1 ;; *) has_get=0 ;;
+esac
+case "$scaler_perms" in
+  *run.workerpools.update*) has_update=1 ;; *) has_update=0 ;;
+esac
+
+if [ "$has_get" = 1 ] && [ "$has_update" = 1 ]; then
+  ok "invoker can get+update Worker Pools"
+else
+  bad "invoker lacks run.workerpools.get/update — the pool will never scale (silently)"
+fi
 
 gcloud services list --enabled --project "$PROJECT" 2>/dev/null | grep -q iamcredentials \
   && ok "iamcredentials API enabled" || bad "iamcredentials API disabled (getAccessToken will fail)"

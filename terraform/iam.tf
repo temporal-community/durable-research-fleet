@@ -23,12 +23,29 @@ resource "google_service_account" "worker_rt" {
   depends_on   = [google_project_service.apis]
 }
 
-# The docs ask for "run.developer or equivalent (must include run.workerPools.get and
-# run.workerPools.update)". We grant the equivalent rather than the predefined role:
+# The docs ask for "run.developer or equivalent (must include run.workerpools.get and
+# run.workerpools.update)". We grant the equivalent rather than the predefined role:
 # project-level roles/run.developer also lets the invoker create, update and DELETE
 # every other Cloud Run resource in this project — including the public web Service.
 # The invoker is the identity Temporal impersonates, so keep it to the two verbs the
 # WCI actually calls.
+#
+# THE RESOURCE IS SPELLED `workerpools`, ALL LOWERCASE, in permission ids — do not
+# "correct" it to the camelCase `run.workerPools.*` that appears in prose and in the
+# resource's own API type name. That spelling is not a real permission, and IAM rejects
+# the whole custom role at apply time:
+#
+#   Permission run.workerPools.get is not valid., badRequest
+#
+# Confirmed against the API on 2026-08-18 — the camelCase filter returns nothing:
+#
+#   gcloud iam list-testable-permissions \
+#     //cloudresourcemanager.googleapis.com/projects/<project> \
+#     --filter="name~run.workerpools"
+#
+# `terraform test` cannot catch a regression here: it is plan-only, and permission ids
+# are not validated until IAM sees them. The tftest assertion below pins the strings,
+# which is the most a plan-time test can do.
 #
 # If scaling ever stops working after touching this, the missing permission shows up
 # in the Temporal server log, not in GCP:
@@ -38,8 +55,8 @@ resource "google_project_iam_custom_role" "worker_pool_scaler" {
   title       = "Serverless Workers — Worker Pool scaler"
   description = "Minimum for the Temporal invoker SA to read and resize a Cloud Run Worker Pool."
   permissions = [
-    "run.workerPools.get",
-    "run.workerPools.update",
+    "run.workerpools.get",
+    "run.workerpools.update",
   ]
 }
 

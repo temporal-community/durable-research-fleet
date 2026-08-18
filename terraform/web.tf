@@ -168,7 +168,7 @@ resource "google_cloud_run_v2_service" "web" {
 # and cannot be asked to authenticate to GCP.
 #
 # It is also the sharpest edge in this stack: an unauthenticated POST starts a
-# Workflow that spends money on Claude tokens. Four things bound the damage, and
+# Workflow that spends money on Gemini tokens. Four things bound the damage, and
 # all four should stay in place:
 #
 #   1. var.demo_passcode         a shared code announced from the stage

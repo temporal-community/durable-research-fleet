@@ -6,6 +6,20 @@
 # and fast. They exist because each assertion below corresponds to a real bug this
 # stack has already had.
 
+# Every run is a plan-time wiring assertion. Mock Google so the suite needs no
+# Application Default Credentials and can never mutate a real project.
+mock_provider "google" {}
+
+override_resource {
+  target = google_service_account.worker_rt
+  values = {
+    account_id = "research-fleet-worker-rt"
+    email      = "research-fleet-worker-rt@serverless-workers-demo.iam.gserviceaccount.com"
+    name       = "projects/serverless-workers-demo/serviceAccounts/research-fleet-worker-rt@serverless-workers-demo.iam.gserviceaccount.com"
+  }
+  override_during = plan
+}
+
 variables {
   project_id      = "serverless-workers-demo"
   region          = "us-central1"
@@ -13,6 +27,11 @@ variables {
   name_prefix     = "research-fleet"
   build_id        = "v1"
   deployment_name = "research-fleet"
+  # The plan validates that a path exists; tests do not execute or upload it.
+  temporal_cli_binary = "../Makefile"
+  # Keep plan-only tests hermetic: production may auto-detect the operator's IP,
+  # but tests must not disclose it to api.ipify.org.
+  ssh_source_ranges = ["127.0.0.1/32"]
 }
 
 run "worker_pool_env_contract" {
@@ -63,6 +82,22 @@ run "worker_pool_env_contract" {
     ]) == 1
     error_message = "pool must set GRACEFUL_SHUTDOWN_SECONDS so scale-in can drain (KB §7.3)"
   }
+
+  assert {
+    condition = length([
+      for e in google_cloud_run_v2_worker_pool.fleet.template[0].containers[0].env :
+      e if e.name == "GEMINI_MODEL" && e.value == var.gemini_model
+    ]) == 1
+    error_message = "pool must pass the configured Gemini model to the Worker"
+  }
+
+  assert {
+    condition = length([
+      for e in google_cloud_run_v2_worker_pool.fleet.template[0].containers[0].env :
+      e if e.name == "ANTHROPIC_MODEL" && e.value == var.anthropic_model
+    ]) == 1
+    error_message = "pool must pass the configured Claude model to the Worker"
+  }
 }
 
 run "worker_pool_starts_empty_and_stays_private" {
@@ -107,10 +142,10 @@ run "iam_least_privilege_and_the_actas_binding" {
   # if scaling breaks, this is the first place to look.
   assert {
     condition = toset(google_project_iam_custom_role.worker_pool_scaler.permissions) == toset([
-      "run.workerPools.get",
-      "run.workerPools.update",
+      "run.workerpools.get",
+      "run.workerpools.update",
     ])
-    error_message = "invoker needs exactly run.workerPools.get + update — no more, no less"
+    error_message = "invoker needs exactly run.workerpools.get + update — no more, no less"
   }
 
   # The binding's `role` is the custom role's id, which is only known after apply, so
@@ -283,12 +318,20 @@ run "the_web_tier_is_a_service_not_a_worker_pool" {
   }
 }
 
-run "the_claude_key_never_lands_in_state" {
+run "provider_keys_never_land_in_state" {
   command = plan
 
   # Injected by reference, not by value. A `sensitive` variable would still be
   # written to terraform.tfstate in the clear — and state on this repo has already
   # been a real exposure.
+  assert {
+    condition = length([
+      for e in google_cloud_run_v2_worker_pool.fleet.template[0].containers[0].env :
+      e if e.name == "GEMINI_API_KEY" && length(e.value_source) == 1
+    ]) == 1
+    error_message = "GEMINI_API_KEY must come from a secret_key_ref, never a plaintext value"
+  }
+
   assert {
     condition = length([
       for e in google_cloud_run_v2_worker_pool.fleet.template[0].containers[0].env :
@@ -298,16 +341,28 @@ run "the_claude_key_never_lands_in_state" {
   }
 
   # No key supplied by default, so a clean apply works and the hello app (and
-  # `make verify SCALE=1`) keeps passing without any Claude credentials.
+  # `make verify SCALE=1`) keeps passing without any Gemini credentials.
+  assert {
+    condition     = var.gemini_api_key == null
+    error_message = "gemini_api_key must default to null; populate the secret out of band"
+  }
+
+
   assert {
     condition     = var.anthropic_api_key == null
     error_message = "anthropic_api_key must default to null; populate the secret out of band"
   }
 
-  # Only the Worker reads it. The web tier never calls Claude.
+  # Only the Worker reads it. The web tier never calls Gemini.
+  assert {
+    condition     = google_secret_manager_secret_iam_member.worker_reads_gemini.member == "serviceAccount:${google_service_account.worker_rt.email}"
+    error_message = "only the Worker runtime SA should be able to read the Gemini key"
+  }
+
+
   assert {
     condition     = google_secret_manager_secret_iam_member.worker_reads_anthropic.member == "serviceAccount:${google_service_account.worker_rt.email}"
-    error_message = "only the Worker runtime SA should be able to read the Claude key"
+    error_message = "only the Worker runtime SA should be able to read the Anthropic key"
   }
 }
 
@@ -342,7 +397,7 @@ run "required_apis_are_enabled" {
         "iamcredentials.googleapis.com", # else: getAccessToken denied
         "iam.googleapis.com",            # else: SERVICE_DISABLED creating SAs
         "cloudresourcemanager.googleapis.com",
-        "secretmanager.googleapis.com", # else: the pool can't read the Claude key
+        "secretmanager.googleapis.com", # else: the pool can't read the Gemini key
       ] : contains(keys(google_project_service.apis), api)
     ])
     error_message = "a required API is missing from the enablement list"

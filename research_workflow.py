@@ -30,12 +30,12 @@ from temporalio.common import RetryPolicy, VersioningBehavior
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from llm import Usage
+    from llm import DEFAULT_PROVIDER, PROVIDERS, Usage
     from research_activities import plan_research, research_subquestion, synthesize
-    from research_types import Answer, Finding, ResearchPlan, SubQuestion
+    from research_types import Answer, Finding, ResearchPlan, ResearchRequest, SubQuestion
 
 # Invariant: HEARTBEAT_INTERVAL (15s) < HEARTBEAT_TIMEOUT < START_TO_CLOSE.
-# 1200s because `llm.complete` makes up to 3 rounds x 300s = 900s for ONE Activity.
+# 1200s leaves headroom around one Gemini request with a 300s HTTP ceiling.
 # heartbeat_timeout stays 60s regardless — that is the point of heartbeating on a
 # timer: liveness is decoupled from call duration.
 RESEARCH_START_TO_CLOSE_SECONDS = 1200
@@ -54,8 +54,8 @@ REVIEW_TIMEOUT_SECONDS = 2 * 60 * 60
 # spend ceiling for a single question as well as a complexity ceiling.
 MAX_REVIEW_ROUNDS = 1
 
-# Slower than the hello app's on purpose: ~120 concurrent Opus 5 calls means 429s are
-# expected, and Temporal is the ONLY retry layer, so this must ride one out alone.
+# Slower than the hello app's on purpose: a room can create many concurrent Gemini
+# calls, so 429s are expected. Temporal is the only retry layer.
 RESEARCH_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
     backoff_coefficient=2.0,
@@ -72,6 +72,7 @@ class _State:
     """Everything the console reads, via the `progress` Query."""
 
     question: str = ""
+    provider: str = DEFAULT_PROVIDER
     stage: str = "planning"
     sub_questions: list[str] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
@@ -111,6 +112,7 @@ class ResearchWorkflow:
         s = self._s
         return {
             "question": s.question,
+            "provider": s.provider,
             "stage": s.stage,
             "sub_questions": s.sub_questions,
             "findings": [
@@ -171,8 +173,27 @@ class ResearchWorkflow:
     # ------------------------------------------------------------------ run
 
     @workflow.run
-    async def run(self, question: str) -> Answer:
+    async def run(self, request: ResearchRequest | str | dict) -> Answer:
+        # A plain string remains accepted for CLI/backwards compatibility and uses
+        # the public default. The web sends ResearchRequest-shaped JSON so provider
+        # choice is explicit in Workflow input and durable event history.
+        if isinstance(request, str):
+            question = request
+            provider = DEFAULT_PROVIDER
+        elif isinstance(request, dict):
+            question = str(request.get("question", ""))
+            provider = str(request.get("provider", DEFAULT_PROVIDER))
+        else:
+            question = request.question
+            provider = request.provider
+        provider = provider.strip().lower()
+        if provider not in PROVIDERS:
+            raise ApplicationError(
+                f"unsupported research provider {provider!r}", non_retryable=True
+            )
+
         self._s.question = question
+        self._s.provider = provider
 
         subs = await self._plan(question)
         await self._research(subs)
@@ -202,12 +223,12 @@ class ResearchWorkflow:
         prompt = question if not note else f"{question}\n\nFocus specifically on: {note}"
         plan: ResearchPlan = await workflow.execute_activity(
             plan_research,
-            prompt,
+            args=[prompt, self._s.provider],
             start_to_close_timeout=timedelta(seconds=PLAN_START_TO_CLOSE_SECONDS),
             heartbeat_timeout=timedelta(seconds=SHORT_HEARTBEAT_TIMEOUT_SECONDS),
             retry_policy=RESEARCH_RETRY,
         )
-        # Planning is a real Opus 5 call and has to be counted. Dropping it made the
+        # Planning is a real model call and has to be counted. Dropping it made the
         # dashboard read zero tokens for a question that had already done work.
         self._s.usage = self._s.usage + plan.usage
         self._banked += plan.usage.total_tokens
@@ -258,7 +279,7 @@ class ResearchWorkflow:
     async def _one(self, sub: SubQuestion) -> None:
         finding: Finding = await workflow.execute_activity(
             research_subquestion,
-            sub,
+            args=[sub, self._s.provider],
             start_to_close_timeout=timedelta(seconds=RESEARCH_START_TO_CLOSE_SECONDS),
             # The important one on this platform. Cloud Run decides scale-in at the
             # pool level and does not know which instance is mid-Activity, so an
@@ -280,11 +301,10 @@ class ResearchWorkflow:
         and paid for all of it again. That difference is the number worth putting on
         a screen, and it is measured rather than modelled.
 
-        KEYED ON `attempt`, NOT `resumed`. `resumed` requires a heartbeat to have
-        carried partial work, which requires the Claude call to have crossed a
-        `pause_turn` boundary — and measurement shows that does not happen: every
-        real sub-question completes in one round. Keying the credit on `resumed`
-        meant the counter sat at 0 through the exact demo moment it exists for.
+        KEYED ON `attempt`, NOT only `resumed`. Gemini's grounded GenerateContent
+        request is atomic, so an interrupted call restarts and `resumed` remains
+        false; Claude may resume from pause_turn. The durable sibling-work credit
+        applies to either provider.
         """
         self._s.findings.append(finding)
         self._s.usage = self._s.usage + finding.usage
@@ -316,7 +336,7 @@ class ResearchWorkflow:
         self._s.stage = "drafting"
         answer: Answer = await workflow.execute_activity(
             synthesize,
-            args=[self._s.question, self._s.findings],
+            args=[self._s.question, self._s.findings, self._s.provider],
             start_to_close_timeout=timedelta(seconds=SYNTHESIS_START_TO_CLOSE_SECONDS),
             heartbeat_timeout=timedelta(seconds=SHORT_HEARTBEAT_TIMEOUT_SECONDS),
             retry_policy=RESEARCH_RETRY,
