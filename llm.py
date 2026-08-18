@@ -29,10 +29,15 @@ DEFAULT_PROVIDER = "gemini"
 PROVIDERS = frozenset({"gemini", "anthropic"})
 
 # Model overrides remain deployment settings; the PROVIDER does not.
+#
+# Always name the provider. There is deliberately no bare `MODEL` alias: before the
+# dual-provider port this module exported `MODEL = "claude-opus-5"`, so a name kept
+# "for compatibility" would resolve to a Gemini id for every caller that previously
+# got a Claude one — the same symbol quietly changing provider is worse than an
+# ImportError, which at least points at the line to fix. `test_no_ambiguous_model_alias`
+# keeps it gone.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip()
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5").strip()
-# Backwards-compatible name used by existing Gemini-focused tests and callers.
-MODEL = GEMINI_MODEL
 
 # Gemini performs the search, retrieval and grounding on Google's servers. There
 # is no local tool loop and no separate search API key.

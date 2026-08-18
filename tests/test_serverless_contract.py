@@ -306,6 +306,32 @@ def test_the_llm_seam_does_not_import_temporal():
         ), "llm.py must not import temporalio"
 
 
+def test_no_ambiguous_model_alias():
+    """Model constants must name their provider.
+
+    Before the dual-provider port `llm.py` exported `MODEL = "claude-opus-5"`. The port
+    kept the name alive as `MODEL = GEMINI_MODEL` and labelled it backwards-compatible,
+    which is the opposite of what it was: the same public symbol silently changed from a
+    Claude id to a Gemini id, so any caller reaching for it kept working and started
+    talking to the other provider. An ImportError is the better failure — it names the
+    line to fix instead of returning a plausible wrong model.
+
+    Both request builders must read the explicit names, so nothing needs the alias.
+    """
+    import llm
+
+    assert not hasattr(llm, "MODEL"), (
+        "llm.MODEL is provider-ambiguous — it meant Claude before the dual-provider "
+        "port and would mean Gemini now. Use GEMINI_MODEL or ANTHROPIC_MODEL."
+    )
+    assert llm.GEMINI_MODEL and llm.ANTHROPIC_MODEL
+    assert llm.GEMINI_MODEL != llm.ANTHROPIC_MODEL
+
+    src = inspect.getsource(llm)
+    assert "model=GEMINI_MODEL" in src, "the Gemini call must name the Gemini model"
+    assert '"model": ANTHROPIC_MODEL' in src, "the Claude call must name the Claude model"
+
+
 def test_only_temporal_retries():
     """Two retry layers multiply into latency nobody can reason about, and a
     hand-rolled one is the thing this demo argues against. Both clients disable SDK
