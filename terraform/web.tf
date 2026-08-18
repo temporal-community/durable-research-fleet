@@ -42,12 +42,16 @@ resource "google_cloud_run_v2_service" "web" {
   # hostname was derivable rather than obscure. The earlier "nobody can find it"
   # reasoning (wildcard cert, so no Certificate Transparency entry) did not hold.
   #
-  # The demo no longer depends on this Service. The presenter runs the console
+  # The demo does not depend on this Service. The presenter runs the console
   # locally (`make web-local`) against this project's Temporal over the SSH tunnel,
   # so the fan-out and scale-from-zero are still real Cloud Run behaviour with no
-  # public surface. Set this back to INGRESS_TRAFFIC_ALL only with a documented
-  # org-policy exception, not by reaching for invoker_iam_disabled again.
-  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  # public surface.
+  #
+  # `web_public = true` opens both this and the invoker check below. It defaults to
+  # false and is deliberately NOT set in any committed file — set it in
+  # terraform/terraform.tfvars, which is gitignored, so the public repo never ships
+  # the open configuration. See the variable's own comment for the cost.
+  ingress = var.web_public ? "INGRESS_TRAFFIC_ALL" : "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
   # Authentication required. This was `true` until 2026-07-31.
   #
@@ -59,9 +63,15 @@ resource "google_cloud_run_v2_service" "web" {
   # Public Access" no matter what `ingress` is set to. That is what security's scan
   # sees, so internal-only ingress alone does not close the finding.
   #
-  # Access is now an ordinary IAM grant to named identities (below), which are
+  # Access is otherwise an ordinary IAM grant to named identities (below), which are
   # in-domain and therefore permitted by the policy. Nothing is granted by default.
-  invoker_iam_disabled = false
+  #
+  # Note that a `web_invoker_users` grant does NOT make the page openable in a
+  # browser: Cloud Run's IAM check wants an `Authorization: Bearer` header and a
+  # browser never sends one. That grant serves `curl -H "Authorization: Bearer
+  # $(gcloud auth print-identity-token)"`, not a projector. Browser access without
+  # invoker_iam_disabled needs IAP in front of an external load balancer.
+  invoker_iam_disabled = var.web_public
 
   template {
     service_account = google_service_account.web_rt.email

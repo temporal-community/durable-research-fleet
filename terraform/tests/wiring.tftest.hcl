@@ -252,6 +252,16 @@ run "worker_controller_dynamic_config" {
 run "the_web_tier_is_a_service_not_a_worker_pool" {
   command = plan
 
+  # Pin web_public to the committed default. `terraform test` auto-loads
+  # terraform.tfvars, so an operator who sets `web_public = true` locally for a live
+  # demo would otherwise turn the two exposure assertions below green-by-vacuum —
+  # the suite would stop guarding the posture precisely while it is open. What these
+  # assertions defend is what the repo ships, which is independent of any local
+  # override, so state that here rather than reading it from the environment.
+  variables {
+    web_public = false
+  }
+
   # THE thing to get wrong. The web tier is request-serving and is an ordinary
   # Temporal CLIENT; the Worker Pool is long-lived pollers scaled by the WCI. They
   # are different Cloud Run products.

@@ -207,6 +207,17 @@ variable "web_invoker_users" {
   default     = []
 }
 
+variable "web_public" {
+  description = "Make the web Service reachable from the internet with NO authentication: ingress ALL and invoker_iam_disabled = true. This is the configuration an external scan flagged on 2026-07-31, and the Cloud Run console will report the Service as 'Authentication: Public Access' regardless of anything else. It is here because a live conference demo where the room asks questions from their own phones has no other route on this org — domain-restricted sharing refuses allUsers, and browsers cannot satisfy a Cloud Run IAM check. demo_passcode is what bounds spend while it is open, so never set this true with an empty passcode. Set it ONLY in terraform/terraform.tfvars (gitignored), turn it off the same day, and rotate the passcode afterwards."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = var.web_public == false || length(var.demo_passcode) > 0
+    error_message = "web_public = true requires a non-empty demo_passcode — an open page with no passcode lets anyone spend tokens against whichever provider key they select. Set it in terraform/terraform.tfvars, not with -var, or a plain `make apply` resets it to \"\"."
+  }
+}
+
 variable "max_subquestions" {
   description = "Fan-out width: how many sub-questions one question becomes. With one Activity slot per instance this IS the Serverless Worker count the room watches. The planner always returns the top of its range, so this value — not the wording of the question — decides the width. 6 is the full demo; 3 gives a smaller, faster fan-out."
   type        = number
