@@ -133,6 +133,42 @@ The Temporal/Cloud Run infrastructure observations below come from 2026-07/08
 deployments. The provider seam is covered by offline fakes; tests must never make a
 real model request.
 
+**Dual-provider code verified live on 2026-08-18** against `serverless-workers-demo`,
+Worker Pool revision `research-fleet-worker-pool-00004-dx8`:
+
+- The Terraform delta from the Claude-only stack is **additive** — `2 to add, 1 to
+  change, 0 to destroy` (the `${prefix}-gemini-api-key` secret, its accessor binding,
+  and three pool env vars). Moving a deployed stack onto this code needs **no
+  `terraform destroy`**. Do not tell anyone otherwise without re-running `make plan`.
+- Because the env vars change, the resulting new revision re-resolves the `:v1` tag to
+  the freshly pushed digest. The manual `gcloud run worker-pools update --image <digest>`
+  dance in gate #14 is only needed when the image changes and nothing else does.
+- `make verify SCALE=1`: **16 passed, 0 failed**, including the `workerPoolScaler`
+  role-name assertion in `scripts/verify_stack.sh` (the live policy does carry the
+  custom role under that exact name).
+- A real Gemini `ResearchWorkflow` completed end to end in **74s** wall-clock:
+  `plan_research` 5s, four `research_subquestion` Activities (10/11/16/20s run, 0/10/21/21s
+  queued behind the one-slot limit), `synthesize` 28s. 9 grounded searches, 25 sources,
+  0 failures, `Pinned` / `research-fleet:v1`, `COMPLETED`.
+- **The VM is not a bottleneck.** e2-small sat at load average 0.00 with the Temporal
+  process at 1.6% CPU and 1.4 GB of 1.9 GB free while all of the above ran. Latency in a
+  run is model time plus the deliberate one-slot queue wait. Do not "fix" slowness by
+  resizing the VM.
+
+Measured provider asymmetry on the same question class, `MAX_SUBQUESTIONS=6`:
+
+| | sub-questions | searches | total tokens | cache reads |
+|---|---|---|---|---|
+| Claude | 6 | 52 | 713,758 | 508,487 (71%) |
+| Gemini | 4 | 11 | 29,329 | 0 |
+
+`MAX_SUBQUESTIONS` is a ceiling, not a target: `plan_research` asks for
+`MIN_SUBQUESTIONS`–`MAX_SUBQUESTIONS` and `texts[:MAX_SUBQUESTIONS]` truncates without
+padding. Fan-out width is the Worker count on the projector, so on Gemini that number is
+smaller and varies per question. Raise `MIN_SUBQUESTIONS` if a fixed width is needed.
+Gemini's 0 cache reads are expected — `cache_system=True` is Claude-only and Gemini
+relies on best-effort implicit caching of the `SYSTEM_RESEARCH` prefix.
+
 - Both provider clients are lazy. The hello app and `make verify SCALE=1` work
   without either API key; only the selected provider's research call needs its key.
 - Google Search grounding is one atomic GenerateContent request. Timer heartbeats

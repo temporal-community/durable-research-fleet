@@ -16,7 +16,7 @@
 
 A conference-ready deep-research demo powered by **Temporal Serverless Workers** and **Google Cloud Run**, with **Gemini + Google Search** as the UI default and **Claude + Web Search** available per request.
 
-One question becomes up to six independent research jobs. Each job maps to one Cloud Run Worker, the pool scales `0 → N → 0`, and Temporal preserves the plan, findings, report, and human-review pause throughout.
+One question becomes several independent research jobs (3–6, decided by the planner). Each job maps to one Cloud Run Worker, the pool scales `0 → N → 0`, and Temporal preserves the plan, findings, report, and human-review pause throughout.
 
 > **🎬 See the story:** ask from the workbench, watch Serverless Workers climb in the sticky footer, review the cited draft, then approve it after the pool has returned to zero.
 
@@ -26,13 +26,13 @@ One question becomes up to six independent research jobs. Each job maps to one C
 
 | Moment | What happens | Why it matters |
 |---|---|---|
-| 🔀 **Research fan-out** | One question becomes ~6 independent sub-questions | Parallel work creates real Task Queue backlog |
+| 🔀 **Research fan-out** | One question becomes 3–6 independent sub-questions | Parallel work creates real Task Queue backlog |
 | 🚀 **Workers from zero** | Cloud Run adds one-slot Workers to meet that backlog | The fleet is created for the work, not kept warm |
 | 🔎 **Grounded research** | Choose Gemini + Google Search or Claude + Web Search in the workbench | Findings return with sources instead of unsupported prose |
 | ⏸️ **Durable review** | The Workflow parks with a finished draft and no active task | State survives without an app server or database holding the request open |
 | ⚡ **Wake from zero** | Accept or refine sends a Temporal Signal | A live Workflow wakes even after the Worker Pool has scaled away |
 
-> **Last live infrastructure verification — August 15, 2026:** 16/16 deployment checks passed. Five queued smoke-test Workflows took the Worker Pool from **0 to 4 instances in 20 seconds**. The smoke test uses no model tokens.
+> **Last live infrastructure verification — August 18, 2026:** 16/16 deployment checks passed. Five queued smoke-test Workflows took the Worker Pool from **zero to its first instance in 20 seconds**, peaking at 6 while the backlog drained. The smoke test uses no model tokens. A real Gemini run on the same deployment completed plan → 4-way fan-out → synthesis → review → accept in **74 seconds**.
 
 ## 🏗 Why this architecture?
 
@@ -63,7 +63,7 @@ The outline sits on the left, the cited report in the middle, sources on the rig
 
 ![Live fleet counters](docs/images/footer-workers.png)
 
-Temporal shows six `research_subquestion` Activities overlapping, followed by synthesis and a timer ended early by the human-review Signal:
+Temporal shows the `research_subquestion` Activities overlapping, followed by synthesis and a timer ended early by the human-review Signal. This timeline is a six-wide Claude run; a Gemini run is usually narrower (see the note on fan-out width below):
 
 ![Temporal timeline: concurrent research followed by review](docs/images/temporal-timeline.png)
 
@@ -114,9 +114,17 @@ make web-local
 
 Open **http://localhost:8000** and choose a provider next to the ask button. Gemini is selected by default. The choice is recorded in Workflow input, so retries, review, and refinement stay on that provider even when both modes run in the same deployment.
 
-One run uses one planning call, up to six grounded research calls, and one synthesis call. A refine decision may trigger one additional bounded fan-out.
+One run uses one planning call, 3–6 grounded research calls, and one synthesis call. A refine decision may trigger one additional bounded fan-out.
 
-The higher slot count is only for local development. Keep the deployed value at `1`: one Activity slot per instance is what turns a six-way fan-out into a visible Serverless Worker fleet.
+The higher slot count is only for local development. Keep the deployed value at `1`: one Activity slot per instance is what turns the fan-out into a visible Serverless Worker fleet.
+
+`MAX_SUBQUESTIONS` is a **ceiling, not a target.** The planner is asked for between
+`MIN_SUBQUESTIONS` and `MAX_SUBQUESTIONS` sub-questions and the result is truncated to the
+ceiling, never padded up to it — so the width, and therefore the Worker count on screen, is
+whatever the model returned. Measured on the same question class with `MAX_SUBQUESTIONS=6`:
+Claude returned 6, Gemini returned 4. If you need a specific number in front of a room, raise
+`MIN_SUBQUESTIONS` in `research_activities.py` rather than trusting the planner to reach the top
+of its range.
 
 ## Deploy to GCP
 
@@ -191,7 +199,7 @@ Local defaults target `temporal server start-dev`.
 | `TEMPORAL_API_KEY` | unset | Temporal Cloud credential; setting it enables TLS |
 | `TEMPORAL_DEPLOYMENT_NAME` | `research-fleet` | Versioned Worker Deployment name |
 | `MAX_CONCURRENT_ACTIVITIES` | `1` | Activity slots per Worker; raising this hides deployed scaling |
-| `MAX_SUBQUESTIONS` | `6` | Fan-out width and approximate Worker count per question |
+| `MAX_SUBQUESTIONS` | `6` | Fan-out **ceiling**; the planner may return fewer, so the Worker count varies by provider |
 | `RESEARCH_EFFORT` | `medium` | Provider effort / thinking level |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Model selected without rebuilding the image |
 | `GEMINI_API_KEY` | unset | Required only when a research Activity first calls Gemini |
