@@ -2,6 +2,7 @@
 
 [![Temporal](https://img.shields.io/badge/Temporal-Serverless%20Workers-141414?logo=temporal&logoColor=white)](https://temporal.io)
 [![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Run%20Worker%20Pools-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/run/docs/workerpools)
+[![Google Gen AI SDK](https://img.shields.io/badge/Google-Gen%20AI%20SDK-4285F4?logo=google&logoColor=white)](https://googleapis.github.io/python-genai/)
 [![Gemini](https://img.shields.io/badge/Gemini-3.6%20Flash-8E75B2?logo=googlegemini&logoColor=white)](https://ai.google.dev/gemini-api/docs)
 [![Claude](https://img.shields.io/badge/Claude-optional-D97757?logo=anthropic&logoColor=white)](https://docs.anthropic.com/)
 [![Tests](https://img.shields.io/badge/tests-113%20passing-22C55E)](#test-it)
