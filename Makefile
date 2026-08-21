@@ -46,6 +46,10 @@ AUTO_SCALED_WORKERS_VERSION ?= v0.0.0-20260811170210-91f6fe1d10ab
 #   make tunnel LOCAL_FRONTEND_PORT=7433
 LOCAL_FRONTEND_PORT ?= 7233
 LOCAL_UI_PORT       ?= 8233
+# The console's own port. 8000 is a popular default (uvicorn, http.server, plenty of
+# dev servers), so this is overridable for the same reason the tunnel ports are:
+#   make web-local WEB_PORT=8100
+WEB_PORT            ?= 8000
 
 IMAGE := $(REGION)-docker.pkg.dev/$(PROJECT)/$(PREFIX)-repo/research-worker:$(BUILD_ID)
 TF    := terraform -chdir=terraform
@@ -247,10 +251,12 @@ register-queues: ## One-time after first apply: let the pool poll once so Task Q
 #   - raise the slot count LOCALLY only. The deployed default of 1 is what makes one
 #     question light up six Serverless Workers; locally there is no Worker Controller
 #     to scale, so slot=1 just serialises six multi-minute Activities for no gain.
-web-local: ## Serve the research console against a local dev server
-	@echo "==> http://localhost:8000   (phone and projector — one page)"
-	TEMPORAL_ADDRESS=$${TEMPORAL_ADDRESS:-localhost:7233} \
-	  .venv/bin/python -m uvicorn web:app --reload --port 8000 --no-proxy-headers
+web-local: ## Serve the research console (WEB_PORT, against LOCAL_FRONTEND_PORT)
+	$(call check_port,$(WEB_PORT),web-local,WEB_PORT)
+	@echo "==> http://localhost:$(WEB_PORT)   (phone and projector — one page)"
+	@echo "    talking to Temporal at localhost:$(LOCAL_FRONTEND_PORT)"
+	TEMPORAL_ADDRESS=$${TEMPORAL_ADDRESS:-localhost:$(LOCAL_FRONTEND_PORT)} \
+	  .venv/bin/python -m uvicorn web:app --reload --port $(WEB_PORT) --no-proxy-headers
 
 ## --- tests ---------------------------------------------------------------
 
@@ -284,16 +290,39 @@ define check_port
 	  exit 1; } || true
 endef
 
+# A bare `gcloud compute ssh -L` tunnel is a single TCP connection with no
+# keepalive, and it dies for reasons that have nothing to do with the demo:
+# a VPN re-handshake, a laptop sleeping, a network switch. When it dies the
+# console keeps serving pages while every Temporal call fails, which reads on
+# stage as "the app is broken" rather than "the tunnel dropped".
+#
+# So: ServerAliveInterval notices a dead peer in ~45s instead of hanging, and
+# the while-loop re-dials. ExitOnForwardFailure matters more than it looks --
+# without it ssh happily connects while silently failing to bind the local
+# port, so you get a live session forwarding nothing.
+#
+# The trade-off is that Ctrl-C now has to break the loop, not just ssh, hence
+# the explicit trap.
+define ssh_tunnel
+	@echo "==> $(3) on localhost:$(1) — leave this running (auto-reconnects)"
+	@trap 'echo; echo "==> tunnel closed"; exit 0' INT; \
+	while true; do \
+	  gcloud compute ssh $(PREFIX)-temporal --zone $(ZONE) --project $(PROJECT) -- -N \
+	    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+	    -L $(1):localhost:$(2) || true; \
+	  echo "    [$$(date +%H:%M:%S)] tunnel on $(1) dropped — reconnecting in 5s"; \
+	  sleep 5; \
+	done
+endef
+
 tunnel: ## Forward the frontend to localhost:$(LOCAL_FRONTEND_PORT) (starter.py then works unchanged)
 	$(call check_port,$(LOCAL_FRONTEND_PORT),tunnel,LOCAL_FRONTEND_PORT)
-	@echo "==> frontend on localhost:$(LOCAL_FRONTEND_PORT) — leave this running"
 	@echo "    TEMPORAL_ADDRESS=localhost:$(LOCAL_FRONTEND_PORT) .venv/bin/python starter.py --watch"
-	gcloud compute ssh $(PREFIX)-temporal --zone $(ZONE) --project $(PROJECT) -- -N -L $(LOCAL_FRONTEND_PORT):localhost:7233
+	$(call ssh_tunnel,$(LOCAL_FRONTEND_PORT),7233,frontend)
 
 ui: ## Forward the Temporal Web UI to http://localhost:$(LOCAL_UI_PORT)
 	$(call check_port,$(LOCAL_UI_PORT),ui,LOCAL_UI_PORT)
-	@echo "==> Temporal UI at http://localhost:$(LOCAL_UI_PORT) — leave this running"
-	gcloud compute ssh $(PREFIX)-temporal --zone $(ZONE) --project $(PROJECT) -- -N -L $(LOCAL_UI_PORT):localhost:8233
+	$(call ssh_tunnel,$(LOCAL_UI_PORT),8233,Temporal UI)
 
 fmt:
 	$(TF) fmt

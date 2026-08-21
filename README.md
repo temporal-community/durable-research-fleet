@@ -158,12 +158,20 @@ make tunnel PROJECT=your-project-id
 make web-local
 ```
 
-Then open **http://localhost:8000**. If port `7233` is already occupied, use:
+Then open **http://localhost:8000**. Both tunnels auto-reconnect, so a VPN
+re-handshake or a laptop sleeping costs about five seconds instead of the run.
+
+Every local port is overridable, which matters if you already have a Temporal dev
+server or another app running. `web-local` follows `LOCAL_FRONTEND_PORT`, so pass
+the same value to both and nothing else needs setting:
 
 ```bash
 make tunnel PROJECT=your-project-id LOCAL_FRONTEND_PORT=7433
-TEMPORAL_ADDRESS=localhost:7433 make web-local
+make web-local LOCAL_FRONTEND_PORT=7433 WEB_PORT=8100
 ```
+
+If SSH times out rather than refusing, the SSH firewall rule is pinned to a public
+IP you no longer have — see `ssh_source_ranges` in `terraform/variables.tf`.
 
 The deployed shape is:
 

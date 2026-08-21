@@ -36,8 +36,20 @@ variable "temporal_internal_ip" {
   default     = "10.10.0.10"
 }
 
+# On a rotating-egress VPN (Cloudflare WARP, corporate split-tunnel) the
+# auto-detected /32 goes stale without warning: the rule still looks correct in
+# the console, and SSH fails with a TIMEOUT rather than a refusal, which reads as
+# "the VM is down" instead of "your IP moved". Observed rotating twice in an hour
+# and across a /16, so widening to the VPN's range is sometimes the only way to
+# hold a tunnel open -- but that opens port 22 to every tenant sharing that
+# range, so widen deliberately, set it back to null afterwards, and never leave a
+# widened range in a committed tfvars.
+#
+# Check what the rule actually allows before debugging anything else:
+#   curl -s https://api.ipify.org
+#   gcloud compute firewall-rules describe <prefix>-allow-ssh --format='value(sourceRanges.list())'
 variable "ssh_source_ranges" {
-  description = "CIDRs allowed to SSH the Temporal VM. Leave null to auto-detect this machine's public IP; set [] to block SSH entirely."
+  description = "CIDRs allowed to SSH the Temporal VM. Leave null to auto-detect this machine's public IP; set [] to block SSH entirely. Auto-detect goes stale behind a rotating-egress VPN -- see the note above."
   type        = list(string)
   default     = null
 }
