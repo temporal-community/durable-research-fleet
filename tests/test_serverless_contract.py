@@ -63,11 +63,13 @@ def test_both_apps_are_registered_on_the_pool():
     """The hello app is the infrastructure smoke test and must stay registered: it
     is the only path `make verify SCALE=1` can exercise without either model key.
     """
+    # The registration list now lives in apps.py, shared by every entrypoint.
+    src = open("apps.py").read()
+    assert "HelloWorkflow" in src, "apps.py dropped the smoke-test app"
+    assert "ResearchWorkflow" in src, "apps.py dropped the research app"
+    assert "RESEARCH_ACTIVITIES" in src
     for path in ("worker_cloudrun.py", "worker_local.py"):
-        src = open(path).read()
-        assert "HelloWorkflow" in src, f"{path} dropped the smoke-test app"
-        assert "ResearchWorkflow" in src, f"{path} dropped the research app"
-        assert "RESEARCH_ACTIVITIES" in src
+        assert "from apps import ACTIVITIES, WORKFLOWS" in open(path).read(), path
 
 
 def test_worker_runs_in_versioned_mode():
@@ -329,7 +331,7 @@ def test_no_ambiguous_model_alias():
 
     src = inspect.getsource(llm)
     assert "model=GEMINI_MODEL" in src, "the Gemini call must name the Gemini model"
-    assert '"model": ANTHROPIC_MODEL' in src, "the Claude call must name the Claude model"
+    assert '"model": model or ANTHROPIC_MODEL' in src, "the Claude call must name the Claude model"
 
 
 def test_only_temporal_retries():

@@ -14,7 +14,7 @@
 
 **Ask once. Watch a fleet appear, research in parallel, and disappear — while the Workflow stays alive.**
 
-A conference-ready deep-research demo powered by **Temporal Serverless Workers** and **Google Cloud Run**, with **Gemini + Google Search** as the UI default and **Claude + Web Search** available per request.
+A conference-ready deep-research demo powered by **Temporal Serverless Workers**, runnable two ways: on **Google Cloud Run** (self-hosted Temporal) or on **Amazon Bedrock AgentCore Runtime** (Temporal Cloud). **Claude + Web Search** is the UI default on this branch and **Gemini + Google Search** is available per request.
 
 One question becomes several independent research jobs (3–6, decided by the planner). Each job maps to one Cloud Run Worker, the pool scales `0 → N → 0`, and Temporal preserves the plan, findings, report, and human-review pause throughout.
 
@@ -185,6 +185,57 @@ The deployed shape is:
 
 After rebuilding the image with the same tag, force the Worker Pool onto the new digest; Cloud Run pins image digests per revision. See [AGENTS.md](AGENTS.md) gate #14 for the exact command and the other deployment invariants.
 
+## Deploy to AWS (Bedrock AgentCore + Temporal Cloud)
+
+The same Workflows and Activities run as Temporal Serverless Workers on **Amazon Bedrock AgentCore Runtime**. Temporal Cloud *invokes* a Runtime endpoint when a Task Queue has a backlog; each invocation starts a session (a microVM, up to 8 hours) that polls until it has been idle, then drains. Nothing runs at rest. The full design, decisions and what is and isn't proven live are in **[docs/AGENTCORE.md](docs/AGENTCORE.md)**.
+
+> **Pre-release.** AgentCore as a Serverless Workers compute provider is a Temporal pre-release. Verified live on a Temporal Cloud Namespace in `ca-central-1`, for both the hello smoke test and the research app (Gemini and Claude). Treat the "Verified" and "Still unverified" lists in the docs as the source of truth.
+
+### What you need
+
+| Need | Notes |
+|---|---|
+| **Temporal Cloud Namespace, AWS-hosted** | With the **AgentCore Serverless Workers pre-release** enabled (ask your account team or open a support ticket). Self-hosted Temporal is not covered |
+| **A Temporal Cloud API key** | Ideally a service-account key scoped to this one Namespace |
+| **AWS account and credentials** | Permission for AgentCore, IAM, S3, Secrets Manager. Use a named profile: `AWS_PROFILE=...` |
+| **Region** | An AgentCore-supported Region, ideally next to your Namespace (default `ca-central-1`) |
+| **Temporal CLI ≥ 1.8.3** | For `temporal worker deployment create-version --aws-agentcore-*` |
+| **Terraform ≥ 1.9, `uv`, Python 3.12+** | `uv` builds the arm64 Runtime zip |
+| **A model key** | `ANTHROPIC_API_KEY` for the Claude default, `GEMINI_API_KEY` for Gemini. Either works alone |
+
+### Deploy
+
+```bash
+cp .env.example .env            # add TEMPORAL_API_KEY and your model key(s)
+# agentcore/terraform.tfvars (gitignored):
+#   temporal_namespace = "<name>.<account-id>"
+#   temporal_address   = "<name>.<account-id>.tmprl.cloud:7233"
+#   build_id           = "1.0.0"
+
+export AWS_PROFILE=your-profile
+make ac-plan                    # read-only; review it
+make ac-apply                   # Runtime, endpoint, IAM, S3, Secrets Manager
+make ac-secrets                 # seed Secrets Manager from .env (never touches Terraform state)
+SET_CURRENT=1 make ac-register  # register the Version with Temporal Cloud and route to it
+make ac-verify                  # real Workflows through real invocations; spends no model tokens
+make web-cloud                  # the console, against your Namespace
+```
+
+Any change to the Runtime (code **or** an environment variable) needs a **new `build_id`**, with the previous one added to `retained_build_ids`, because each Build ID is pinned to one immutable Runtime version. `agentcore/guard.sh` refuses an apply that forgets this. Details in the docs.
+
+### Measured on AgentCore (Claude, one question, `1.0.3`)
+
+| | Untuned (`1.0.2`) | Tuned (`1.0.3`) |
+|---|---|---|
+| Plan to synthesis | 276s | **96s** |
+| Web searches / tokens | 66 / 546,837 | 24 / 304,374 |
+
+The tuning is a four-search cap (prompt and tool), Sonnet for the narrow sub-questions with Opus kept for synthesis, and three Activity slots per session. It is one question on one setup; the answer cited more first-party sources but was thinner on pricing detail. Compare a few of your own before trusting it. AgentCore started 2–4 sessions for 5–6 sub-questions, so the Worker count on a projector will be lower and less predictable than on Cloud Run.
+
+### What this stack does not do
+
+No hosted web tier (the console runs locally via `make web-cloud`), no Amazon Bedrock model provider (research calls Anthropic and Google by API key), local Terraform state, and no alarms or CI. See the docs for the full list.
+
 ## How the Workflow runs
 
 ```text
@@ -206,13 +257,17 @@ Local defaults target `temporal server start-dev`.
 | `TEMPORAL_ADDRESS` | `localhost:7233` | Temporal frontend address |
 | `TEMPORAL_API_KEY` | unset | Temporal Cloud credential; setting it enables TLS |
 | `TEMPORAL_DEPLOYMENT_NAME` | `research-fleet` | Versioned Worker Deployment name |
-| `MAX_CONCURRENT_ACTIVITIES` | `1` | Activity slots per Worker; raising this hides deployed scaling |
+| `MAX_CONCURRENT_ACTIVITIES` | `1` | Activity slots per Worker. Keep `1` on Cloud Run (raising it hides scaling); AgentCore is deployed with `3` |
 | `MAX_SUBQUESTIONS` | `6` | Fan-out **ceiling**; the planner may return fewer, so the Worker count varies by provider |
 | `RESEARCH_EFFORT` | `medium` | Provider effort / thinking level |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | Model selected without rebuilding the image |
 | `GEMINI_API_KEY` | unset | Required only when a research Activity first calls Gemini |
 | `ANTHROPIC_MODEL` | `claude-opus-5` | Claude model selected without rebuilding the image |
 | `ANTHROPIC_API_KEY` | unset | Required only when the UI selection is Claude |
+| `ANTHROPIC_RESEARCH_MODEL` | unset | Claude model for the research sub-questions only; AgentCore deploys `claude-sonnet-5-5` |
+| `CLAUDE_MAX_SEARCHES` | `4` | Web searches per Claude request (`0` = uncapped); the research prompt states the same budget |
+| `AGENTCORE_DEBOUNCE_SECONDS` | `60` | AgentCore: how long a Worker polls after its last Activity before draining |
+| `<NAME>_SECRET_ARN` | unset | AgentCore: Secrets Manager ARN resolved at session start for `TEMPORAL_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY` |
 | `DEMO_PASSCODE` | unset | Guards both asking and refinement actions in the web tier |
 
 ## Test it
@@ -221,8 +276,8 @@ Local defaults target `temporal server start-dev`.
 make test
 ```
 
-The suite is offline: **113 Python tests + 10 Terraform contract tests**. Both
-provider clients use fakes and tests never spend tokens.
+The suite is offline: **152 Python tests** plus Terraform contract tests for both stacks
+(`make test-tf`, `make test-ac`). Both provider clients use fakes and tests never spend tokens.
 
 For the live infrastructure gate:
 
@@ -236,10 +291,13 @@ make verify SCALE=1 PROJECT=your-project-id
 |---|---|
 | `runtime.py` | Connection, versioned Worker, slot limits, unique identity, graceful shutdown |
 | `workflows.py` · `activities.py` | Token-free infrastructure smoke test |
+| `apps.py` | The one list of Workflows and Activities every Worker registers |
+| `agentcore_runtime.py` · `worker_agentcore.py` | AgentCore session lifecycle (start, idle-drain, release) and its app binding |
 | `llm.py` | Gemini/Claude provider boundary, isolated from Temporal |
 | `research_*.py` | Plan, parallel research, synthesis, review, and transport types |
 | `web.py` · `web/` | Responsive workbench; FastAPI and vanilla JS, no build step |
 | `terraform/` | Complete private GCP stack |
+| `agentcore/` | AWS stack for AgentCore + Temporal Cloud: Terraform, arm64 build, secrets, registration, live verify |
 | `tests/` | Workflow, replay, web-security, provider, and infrastructure contracts |
 | `learn/` · `docs/` | In-app learning cards, runnable tutorial, and research knowledge base |
 

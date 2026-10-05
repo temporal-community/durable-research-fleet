@@ -94,7 +94,7 @@ check-config:
 	  echo "         make $(MAKECMDGOALS) PROJECT=your-project-id"; \
 	  exit 1; }
 
-.PHONY: help up down image cli plan apply destroy repo bootstrap-log ui tunnel status fmt check-config adopt register-queues test test-py test-tf verify web-local
+.PHONY: ac-build ac-init ac-plan ac-apply ac-secrets ac-register ac-verify ac-down ac-prune web-cloud test-ac help up down image cli plan apply destroy repo bootstrap-log ui tunnel status fmt check-config adopt register-queues test test-py test-tf verify web-local
 
 help:
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | expand -t22
@@ -264,13 +264,16 @@ web-local: ## Serve the research console (WEB_PORT, against LOCAL_FRONTEND_PORT)
 
 ## --- tests ---------------------------------------------------------------
 
-test: test-py test-tf ## Run every offline test (no cloud resources touched)
+test: test-py test-tf test-ac ## Run every offline test (no cloud resources touched)
 
 test-py: ## pytest: workflow, activity, replay and Serverless-contract tests
 	.venv/bin/python -m pytest
 
 test-tf: ## terraform test: plan-only assertions on the stack wiring
 	$(TF) test
+
+test-ac: ## terraform test for the AgentCore stack (mocked provider; no AWS calls)
+	cd agentcore && terraform init -backend=false -input=false >/dev/null && terraform test
 
 verify: ## Verify the LIVE stack (add SCALE=1 for the full scale-from-zero cycle)
 	@PROJECT=$(PROJECT) REGION=$(REGION) ZONE=$(ZONE) PREFIX=$(PREFIX) \
@@ -288,7 +291,7 @@ bootstrap-log: ## Tail the VM bootstrap log
 
 # Fail with a useful message instead of ssh's bare "Address already in use".
 define check_port
-	@lsof -i :$(1) >/dev/null 2>&1 && { \
+	@lsof -nP -iTCP:$(1) -sTCP:LISTEN >/dev/null 2>&1 && { \
 	  echo "ERROR: local port $(1) is already in use."; \
 	  echo "       Pick another:  make $(2) $(3)=<port>"; \
 	  exit 1; } || true
@@ -330,3 +333,52 @@ ui: ## Forward the Temporal Web UI to http://localhost:$(LOCAL_UI_PORT)
 
 fmt:
 	$(TF) fmt
+
+## --- AgentCore on Temporal Cloud (see docs/AGENTCORE.md) -------------------------------
+#
+# A second deployment target, beside the GCP/Cloud Run stack above. The Worker runs in an
+# Amazon Bedrock AgentCore Runtime session and Temporal Cloud invokes it. Order:
+#   make ac-build ac-apply ac-secrets ac-register ac-verify
+# Everything reads agentcore/terraform.tfvars (gitignored) for the Namespace.
+AC := terraform -chdir=agentcore
+
+ac-build: ## Build the arm64 Runtime zip (deterministic, so no spurious versions)
+	./agentcore/build.sh
+
+ac-init:
+	$(AC) init -input=false
+
+ac-plan: ac-init ac-build ## Show the AWS plan
+	./agentcore/guard.sh
+	$(AC) plan -input=false
+
+ac-apply: ac-init ac-build ## Apply the AWS stack (AUTO=1 skips the approval prompt)
+	./agentcore/guard.sh
+	$(AC) apply $(if $(AUTO),-auto-approve,)
+
+ac-secrets: ## Seed Secrets Manager from .env (never overwrites; FORCE=1 to replace)
+	./agentcore/seed-secrets.sh
+
+ac-register: ## Register this build's endpoint with Temporal Cloud (SET_CURRENT=1 to route to it)
+	./agentcore/register.sh
+
+ac-verify: ## Run a real Workflow end to end on AgentCore and check the fleet
+	./agentcore/verify.sh
+
+ac-prune: ## READ-ONLY: show each Version's drainage; only drained ones may leave retained_build_ids
+	@test -f .env || { echo ".env is required (TEMPORAL_API_KEY)"; exit 1; }
+	@set -a; . ./.env; set +a; \
+	  NS=$$($(AC) output -raw temporal_namespace); \
+	  TEMPORAL_ADDRESS=$$NS.tmprl.cloud:7233 TEMPORAL_NAMESPACE=$$NS \
+	  temporal worker deployment describe --name $$($(AC) output -raw deployment_name)
+
+ac-down: ## Destroy the AWS stack (the Temporal Deployment/Version is left; unset it yourself)
+	$(AC) destroy $(if $(AUTO),-auto-approve,)
+
+web-cloud: ## Serve the console against the Temporal Cloud Namespace in .env
+	$(call check_port,$(WEB_PORT),web-cloud,WEB_PORT)
+	@set -a; . ./.env; set +a; \
+	  TEMPORAL_ADDRESS=$$($(AC) output -raw temporal_namespace).tmprl.cloud:7233 \
+	  TEMPORAL_NAMESPACE=$$($(AC) output -raw temporal_namespace) \
+	  TEMPORAL_TASK_QUEUE=$(TASK_QUEUE) \
+	  .venv/bin/python -m uvicorn web:app --port $(WEB_PORT) --no-proxy-headers

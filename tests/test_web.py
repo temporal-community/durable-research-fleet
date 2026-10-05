@@ -106,12 +106,12 @@ def test_no_passcode_configured_means_open(monkeypatch):
     assert web._passcode_ok("anything")
 
 
-def test_provider_is_chosen_in_the_ui_and_gemini_is_default():
+def test_provider_is_chosen_in_the_ui_and_claude_is_default():
     page = (pathlib.Path(__file__).parent.parent / "web" / "index.html").read_text()
-    gemini = '<option value="gemini" selected>'
-    claude = '<option value="anthropic">'
+    claude = '<option value="anthropic" selected>'
+    gemini = '<option value="gemini">'
     assert gemini in page and claude in page
-    assert page.index(gemini) < page.index(claude)
+    assert page.index(claude) < page.index(gemini)
     assert "JSON.stringify({ question, provider" in page
 
     src = inspect.getsource(web.ask)
@@ -176,3 +176,83 @@ def test_only_a_missing_run_is_a_404():
     page = (pathlib.Path(__file__).parent.parent / "web" / "index.html").read_text()
     assert "res.status === 503" in page
     assert "runFailed" in page
+
+
+# --- parked-run cache --------------------------------------------------------------------
+
+
+def _state(stage="awaiting_review"):
+    return {"stage": stage, "awaiting_review": stage == "awaiting_review", "draft": "d"}
+
+
+def test_only_a_parked_run_is_cached(monkeypatch):
+    """A running run's counters move; serving them stale would freeze the progress bar."""
+    monkeypatch.setattr(web, "_review_cache", {})
+    web._review_cache_put("r1", _state("researching"))
+    assert web._review_cache_get("r1") is None
+    web._review_cache_put("r1", _state())
+    assert web._review_cache_get("r1")["stage"] == "awaiting_review"
+
+
+def test_a_run_leaving_review_is_evicted(monkeypatch):
+    monkeypatch.setattr(web, "_review_cache", {})
+    web._review_cache_put("r1", _state())
+    web._review_cache_put("r1", _state("synthesizing"))
+    assert web._review_cache_get("r1") is None
+
+
+def test_the_cache_expires(monkeypatch):
+    monkeypatch.setattr(web, "_review_cache", {})
+    monkeypatch.setattr(web, "REVIEW_CACHE_TTL_SECONDS", 0.0)
+    web._review_cache_put("r1", _state())
+    time.sleep(0.01)
+    assert web._review_cache_get("r1") is None
+
+
+def test_the_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(web, "_review_cache", {})
+    monkeypatch.setattr(web, "REVIEW_CACHE_MAX", 3)
+    for i in range(10):
+        web._review_cache_put(f"r{i}", _state())
+    assert len(web._review_cache) == 3
+    assert web._review_cache_get("r9") is not None  # newest survives, oldest evicted
+
+
+async def test_a_decision_drops_the_cache_before_signalling(monkeypatch):
+    """Dropping AFTER the Signal would let a poll in between re-cache the old state."""
+    monkeypatch.setattr(web, "_review_cache", {})
+    web._review_cache_put("r1", _state())
+    order = []
+
+    class Handle:
+        async def signal(self, *a, **k):
+            order.append(("signal", "r1" in web._review_cache))
+
+    class Client:
+        def get_workflow_handle(self, _):
+            return Handle()
+
+    async def fake_temporal():
+        return Client()
+
+    class Req:
+        client = type("C", (), {"host": "1.1.1.1"})()
+        headers = {}
+
+        async def json(self):
+            return {"decision": "accept"}
+
+    monkeypatch.setattr(web, "temporal", fake_temporal)
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "")
+    await web.decide("r1", Req())
+    assert order == [("signal", False)], "the cache entry must already be gone at Signal time"
+
+
+def test_the_web_default_provider_matches_the_workflow_default():
+    """web.py cannot import llm, so the two constants are kept equal by this test. A drift
+    would make the page and a provider-less request disagree about which model runs.
+    """
+    import llm
+
+    assert web.DEFAULT_PROVIDER == llm.DEFAULT_PROVIDER
+    assert web.PROVIDERS == llm.PROVIDERS

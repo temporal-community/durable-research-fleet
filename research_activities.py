@@ -55,6 +55,12 @@ CHECKPOINT_SUMMARY_CHARS = 4_000
 # rebuild. `high` ran a single sub-question past the original 120s timeout.
 RESEARCH_EFFORT = os.environ.get("RESEARCH_EFFORT", "medium").strip()
 
+# The model for the research sub-questions ONLY (Claude). Each is a narrow, search-bound
+# lookup that returns ~200 words, so a faster model costs little in quality and a lot less
+# in wall-clock time; planning and synthesis stay on ANTHROPIC_MODEL. Unset means the main
+# model, so a deployment that does not opt in is unchanged.
+RESEARCH_MODEL = os.environ.get("ANTHROPIC_RESEARCH_MODEL", "").strip() or None
+
 # Planning is schema-constrained and short; `high` here would spend thinking tokens
 # on something the schema already pins down.
 PLAN_EFFORT = os.environ.get("PLAN_EFFORT", "medium").strip()
@@ -74,7 +80,8 @@ Method:
 - Search the web before you answer. Do not answer from memory, even when you are confident: your training data may be stale, and the entire point of this task is current information.
 - Prefer primary sources over commentary about them. An official statistic, regulatory filing, dataset, standards document or first-party announcement beats a news article summarising it, which in turn beats an aggregator summarising the article.
 - When a question is time-sensitive, establish how current your sources are and say so explicitly. A number with no date attached is not usable by the analyst who reads your answer.
-- Cross-check any figure that matters against a second independent source. If the two disagree, report both, and say which you find more credible and why. Do not silently pick one, and do not average them into a made-up middle.
+- Search budget: you have at most four searches, so plan them. Spend the first on the core of the sub-question, and keep any remainder for the one or two figures the answer depends on. Do not search for background you already know is stable, and stop as soon as you can answer.
+- For a figure that matters, a second independent source is worth one of those searches. If two sources disagree, report both, and say which you find more credible and why. Do not silently pick one, and do not average them into a made-up middle.
 - Recency and quality are different axes. A newer source is not automatically better: a blog post from this week does not override an official dataset from last quarter. Say which you are relying on.
 - Watch for low-quality content: SEO farms, sites that recycle each other's numbers, and AI-generated summaries with no original reporting. Three sites repeating one original claim is one source, not three. Trace a figure to where it actually came from.
 - If a source you need is paywalled or unreachable, say so rather than substituting a weaker source silently.
@@ -295,6 +302,7 @@ async def research_subquestion(
                 max_tokens=16_000,
                 effort=RESEARCH_EFFORT,
                 on_progress=checkpoint if provider == "anthropic" else None,
+                model=RESEARCH_MODEL,
             )
     except asyncio.CancelledError:
         # Graceful shutdown during scale-in cancels in-flight Activities. Emit one
