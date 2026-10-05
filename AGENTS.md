@@ -130,9 +130,12 @@ stack** — the names are baked into every resource — so don't do it casually;
 > **AgentCore target added 2026-10-05** (branch `feat/agentcore-serverless-worker`):
 > the same two apps can run as Temporal Serverless Workers on Amazon Bedrock AgentCore
 > Runtime against ONE Temporal Cloud Namespace. Read `docs/AGENTCORE.md`. It is
-> offline-tested (137 tests, `make test-ac`) and **verified live for the hello app only**
-> (2026-10-05). The research app is not yet run on it; `docs/AGENTCORE.md` lists exactly
-> what is and isn't proven. AgentCore gave 2 Workers for 5 queued tasks, not 5.
+> offline-tested (152 Python tests plus `make test-ac`) and **verified live on 2026-10-05**:
+> the hello smoke test, and the research app with both Claude and Gemini. `docs/AGENTCORE.md`
+> lists exactly what is and isn't proven. Worker counts differ from Cloud Run: Temporal
+> chose 2-4 sessions for 5-6 queued tasks, not one per task.
+> The README's "Choose your platform" table is the user-facing summary of Cloud Run vs
+> AgentCore; keep it in step with this file and `docs/AGENTCORE.md` when either changes.
 > Rules: `agentcore_runtime.py` must not import `bedrock_agentcore` (only
 > `worker_agentcore.py` does); `requirements.txt` must stay free of AgentCore deps so the
 > Cloud Run image is unchanged; an endpoint must never follow a new Runtime version.

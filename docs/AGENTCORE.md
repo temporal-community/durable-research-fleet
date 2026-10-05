@@ -1,5 +1,7 @@
 # Running Research Fleet on Amazon Bedrock AgentCore (Temporal Cloud)
 
+> To compare AgentCore with Cloud Run, see "Choose your platform" in the [README](../README.md#-choose-your-platform). This page is the full technical write-up.
+
 A second deployment target beside the GCP/Cloud Run stack. Same Workflows, same
 Activities, same `runtime.py`; only the compute provider and the Temporal topology
 change. **Pre-release** on Temporal's side: needs the AgentCore Serverless Workers grant
