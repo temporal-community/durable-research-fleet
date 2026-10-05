@@ -256,3 +256,12 @@ def test_the_web_default_provider_matches_the_workflow_default():
 
     assert web.DEFAULT_PROVIDER == llm.DEFAULT_PROVIDER
     assert web.PROVIDERS == llm.PROVIDERS
+
+
+def test_the_page_names_no_single_compute_platform():
+    """The same page is served in front of Cloud Run and AgentCore deployments, so its copy
+    must not claim one. (It said "on Cloud Run workers" until the AgentCore target landed.)
+    """
+    page = (pathlib.Path(__file__).parent.parent / "web" / "index.html").read_text()
+    for platform in ("Cloud Run", "AgentCore", "Lambda"):
+        assert platform not in page, f"index.html names {platform}; keep the copy platform-neutral"
