@@ -149,9 +149,11 @@ run "iam_least_privilege_and_the_actas_binding" {
   }
 
   # The binding's `role` is the custom role's id, which is only known after apply, so
-  # assert on the role_id literal instead — this is a plan-only test suite.
+  # assert on the role_id literal instead — this is a plan-only test suite. Prefix, not
+  # equality: var.scaler_role_suffix exists to bump the id past a 37-day tombstone
+  # (variables.tf), and that bump must not read as "someone swapped in run.developer".
   assert {
-    condition     = google_project_iam_custom_role.worker_pool_scaler.role_id == "workerPoolScaler"
+    condition     = startswith(google_project_iam_custom_role.worker_pool_scaler.role_id, "workerPoolScaler")
     error_message = "the invoker must be bound to the custom scaler role, not roles/run.developer"
   }
 

@@ -31,6 +31,9 @@ BUILD_ID ?= v1
 # Kept as its own variable rather than derived from PREFIX: the infra identifiers say
 # research-fleet/research-queue and renaming them forces resource recreation for no gain.
 TASK_QUEUE ?= research-queue
+# Bump if a redeploy dies on "role_id (workerPoolScaler) ... marked for deletion":
+# GCP reserves a deleted custom role's id for 37 days (terraform/variables.tf).
+SCALER_ROLE_SUFFIX ?=
 GEMINI_MODEL ?= gemini-3.6-flash
 ANTHROPIC_MODEL ?= claude-opus-5
 
@@ -73,7 +76,8 @@ TF_VARS := \
   -var="task_queue=$(TASK_QUEUE)" \
   -var="build_id=$(BUILD_ID)" \
   -var="gemini_model=$(GEMINI_MODEL)" \
-  -var="anthropic_model=$(ANTHROPIC_MODEL)"
+  -var="anthropic_model=$(ANTHROPIC_MODEL)" \
+  -var="scaler_role_suffix=$(SCALER_ROLE_SUFFIX)"
 
 # Fail fast rather than half-deploying on a mismatch.
 #

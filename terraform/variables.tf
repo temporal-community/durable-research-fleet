@@ -247,3 +247,21 @@ variable "anthropic_model" {
   type        = string
   default     = "claude-opus-5"
 }
+
+# Deleting a custom role does not free its id. GCP keeps the role recoverable for 7
+# days, purges it after 30, and RESERVES THE ID FOR 37 — so between day 7 and day 37 a
+# torn-down stack can neither undelete the old role nor create a new one with the same
+# id, and `make up` dies mid-apply on:
+#
+#   Error 400: You can't create a role_id (workerPoolScaler) which has been marked
+#   for deletion, failedPrecondition
+#
+# while `gcloud iam roles undelete` answers NOT_FOUND. Hit on 2026-09-06 redeploying a
+# stack torn down more than a week earlier. Bump this suffix to get a fresh id; the old
+# tombstone ages out on its own. Nothing reads the role by name — verify_stack.sh
+# deliberately checks the two verbs instead (scripts/verify_stack.sh §7).
+variable "scaler_role_suffix" {
+  description = "Suffix for the custom scaler role id; bump if the previous id is tombstoned"
+  type        = string
+  default     = ""
+}

@@ -51,7 +51,7 @@ resource "google_service_account" "worker_rt" {
 # in the Temporal server log, not in GCP:
 #   sudo journalctl -u temporal | grep UpdateWorkerSetSize
 resource "google_project_iam_custom_role" "worker_pool_scaler" {
-  role_id     = "workerPoolScaler"
+  role_id     = "workerPoolScaler${var.scaler_role_suffix}"
   title       = "Serverless Workers — Worker Pool scaler"
   description = "Minimum for the Temporal invoker SA to read and resize a Cloud Run Worker Pool."
   permissions = [
