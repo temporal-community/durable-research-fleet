@@ -115,6 +115,7 @@
       </div>
 
       <p class="err" id="runErr" role="alert"></p>
+      <ul class="live" id="live" aria-live="polite" hidden></ul>
       <div class="prose" id="prose"></div>
 
       <p class="hint" id="permalink" style="margin-top:1.4rem"></p>
@@ -573,8 +574,61 @@ function runFailed(message) {
   $('runErr').textContent = message;
 }
 
+/* ------------------------------------------------- what Temporal says is in flight */
+
+// `/api/run/{id}` is a Query, which needs a live Worker. `/api/run/{id}/activities` is answered
+// by the Temporal service itself, so it keeps working while every Worker is gone. That is the
+// moment worth showing: a Worker died mid-Activity and nothing has been lost.
+let liveNote = '';
+
+function liveSentence(a) {
+  const bits = [];
+  if (a.phase === 'silent') {
+    bits.push('no heartbeat for ' + Math.round(a.silent_for) + 's, the worker may be lost');
+  } else if (a.phase === 'retry_wait') {
+    bits.push((a.worker_lost ? 'worker lost, ' : '') + 'retrying in ' + Math.ceil(a.retry_in) + 's');
+  } else if (a.phase === 'retrying') {
+    bits.push((a.worker_lost ? 'worker lost, ' : '') + 'waiting for a worker to take it');
+  } else if (a.attempt > 1) {
+    bits.push('running again on a new worker');
+  }
+  if (a.attempt > 1 && a.has_checkpoint) bits.push('resuming from its checkpoint');
+  return bits.join(' · ');
+}
+
+function renderLive(acts) {
+  // Only the notable ones. A healthy first attempt is the happy path and would be noise.
+  const notable = acts.filter((a) => a.attempt > 1 || a.phase === 'silent');
+  const ul = $('live');
+  ul.hidden = notable.length === 0;
+  liveNote = '';
+  if (!notable.length) { ul.replaceChildren(); return; }
+  liveNote = notable.some((a) => a.phase === 'silent' || a.worker_lost)
+    ? 'recovering from a lost worker' : 'retrying';
+  const frag = document.createDocumentFragment();
+  notable.forEach((a) => {
+    const li = el('li', 'live-' + a.phase);
+    const name = a.index != null ? 'Part ' + (a.index + 1) : a.type;
+    li.append(el('b', '', name), el('span', 'live-attempt', 'attempt ' + a.attempt));
+    li.append(el('span', 'live-what', liveSentence(a)));
+    frag.append(li);
+  });
+  ul.replaceChildren(frag);
+}
+
+async function pollActivities() {
+  if (!runId || finished) return;
+  try {
+    const res = await fetch('/api/run/' + runId + '/activities');
+    if (!res.ok) return;
+    const d = await res.json();
+    renderLive(d.activities || []);
+  } catch { /* transient; the next tick retries */ }
+}
+
 async function pollRun() {
   if (!runId) return;
+  pollActivities();   // not awaited: it must not delay, or depend on, the Query below
   let s;
   try {
     const res = await fetch('/api/run/' + runId);
@@ -589,8 +643,9 @@ async function pollRun() {
       return;
     }
     if (res.status === 503) {
-      // Name it rather than hiding it: no worker exists yet IS the demo.
-      $('stage').textContent = 'waiting for a worker';
+      // Name it rather than hiding it: no worker exists yet IS the demo. When Temporal
+      // itself says an Activity is being retried, say that instead of a bare "waiting".
+      $('stage').textContent = liveNote || 'waiting for a worker';
       $('stageDot').className = 'pulse hot';
       return;
     }
@@ -611,6 +666,7 @@ async function pollRun() {
   // --- parts, as a tick strip plus a collapsed list
   const subs = s.sub_questions || [];
   const done = new Set((s.findings || []).map((f) => f.question));
+  const byQuestion = new Map((s.findings || []).map((f) => [f.question, f]));
   $('partsCount').textContent = (s.done || 0) + '/' + (s.total || 0);
   $('tabParts').textContent = subs.length ? String(subs.length) : '';
 
@@ -642,7 +698,12 @@ async function pollRun() {
     if (li) {
       li.className = cls;
       li.firstElementChild.textContent = ok ? '✓' : (active ? '▸' : '·');
-      li.lastElementChild.textContent = text;
+      const f = byQuestion.get(text);
+      // A finding on attempt > 1 lost its first worker and finished anyway.
+      const survived = f && (f.attempt > 1 || f.resumed)
+        ? ' · survived a lost worker (attempt ' + f.attempt + (f.resumed ? ', resumed from checkpoint' : '') + ')'
+        : '';
+      li.lastElementChild.textContent = text + survived;
     }
   });
 

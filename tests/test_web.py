@@ -271,3 +271,140 @@ def test_fleet_payload_names_the_platform(monkeypatch):
     """`fleet run` exports FLEET_TARGET so the footer can say which platform is live."""
     src = inspect.getsource(web._read_fleet)
     assert '"target"' in src and "FLEET_TARGET" in src and '"namespace"' in src
+
+
+# --------------------------------------------------------------- live activities
+#
+# The page must keep telling the truth while every Worker is gone, which is when a Query
+# cannot answer. These build real PendingActivityInfo protos: no server, no Worker.
+
+from google.protobuf.timestamp_pb2 import Timestamp  # noqa: E402
+from temporalio.api.common.v1 import Payload, Payloads  # noqa: E402
+from temporalio.api.enums.v1 import PendingActivityState  # noqa: E402
+from temporalio.api.failure.v1 import Failure  # noqa: E402
+from temporalio.api.workflow.v1 import PendingActivityInfo  # noqa: E402
+
+NOW = 1_000_000.0
+
+
+def _ts(seconds: float) -> Timestamp:
+    t = Timestamp()
+    t.FromNanoseconds(int(seconds * 1e9))
+    return t
+
+
+def _pa(activity_id="2", attempt=1, state="STARTED", beat_ago=None, started_ago=5.0,
+        next_in=None, failure=None, checkpoint=False, worker="1@localhost-ab"):
+    pa = PendingActivityInfo(
+        activity_id=activity_id,
+        attempt=attempt,
+        state=getattr(PendingActivityState, f"PENDING_ACTIVITY_STATE_{state}"),
+        last_worker_identity=worker,
+    )
+    pa.activity_type.name = "research_subquestion"
+    if started_ago is not None:
+        pa.last_started_time.CopyFrom(_ts(NOW - started_ago))
+    if beat_ago is not None:
+        pa.last_heartbeat_time.CopyFrom(_ts(NOW - beat_ago))
+    if next_in is not None:
+        pa.next_attempt_schedule_time.CopyFrom(_ts(NOW + next_in))
+    if failure:
+        pa.last_failure.CopyFrom(Failure(message=failure))
+    if checkpoint:
+        pa.heartbeat_details.CopyFrom(Payloads(payloads=[Payload(data=b'{"text":"partial"}')]))
+    return pa
+
+
+def _phase(pa, labels=None):
+    return web.describe_pending_activities([pa], labels or {}, NOW)[0]
+
+
+def test_a_heartbeating_first_attempt_is_running_and_quiet():
+    row = _phase(_pa(beat_ago=3.0))
+    assert row["phase"] == "running" and row["attempt"] == 1 and not row["worker_lost"]
+
+
+def test_no_heartbeat_for_a_while_reads_as_silent_before_temporal_gives_up():
+    row = _phase(_pa(beat_ago=34.0))
+    assert row["phase"] == "silent" and row["silent_for"] == 34.0
+
+
+def test_a_lost_worker_shows_a_retry_countdown_and_its_checkpoint():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", next_in=12.0,
+                     failure="Activity heartbeat timeout", checkpoint=True))
+    assert row["phase"] == "retry_wait"
+    assert row["retry_in"] == 12.0
+    assert row["worker_lost"] and row["has_checkpoint"]
+
+
+def test_after_the_backoff_it_waits_for_a_worker_not_a_countdown():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", next_in=-3.0))
+    assert row["phase"] == "retrying" and row["retry_in"] is None
+
+
+def test_a_first_attempt_nobody_has_taken_is_queued():
+    assert _phase(_pa(state="SCHEDULED", started_ago=None))["phase"] == "queued"
+
+
+def test_an_ordinary_failure_is_not_called_a_lost_worker():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", next_in=5.0, failure="Error code: 429 rate limited"))
+    assert not row["worker_lost"] and row["last_failure"].startswith("Error code: 429")
+
+
+def test_long_failures_are_clipped_to_one_line():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", failure="x\n" * 400))
+    assert "\n" not in row["last_failure"] and len(row["last_failure"]) <= 160
+
+
+def test_rows_carry_their_sub_question_and_sort_by_it():
+    pas = [_pa(activity_id="4"), _pa(activity_id="3")]
+    labels = {"3": {"index": 0, "text": "first"}, "4": {"index": 1, "text": "second"}}
+    rows = web.describe_pending_activities(pas, labels, NOW)
+    assert [r["index"] for r in rows] == [0, 1] and rows[0]["text"] == "first"
+
+
+async def test_labels_are_read_from_history_once_and_survive_a_bad_payload(monkeypatch):
+    from temporalio.api.history.v1 import HistoryEvent
+
+    def scheduled(activity_id, name):
+        ev = HistoryEvent()
+        a = ev.activity_task_scheduled_event_attributes
+        a.activity_id = activity_id
+        a.activity_type.name = name
+        a.input.payloads.add(data=b"{}")
+        return ev
+
+    class Handle:
+        calls = 0
+
+        async def fetch_history_events(self):
+            Handle.calls += 1
+            for ev in (scheduled("1", "plan_research"), scheduled("2", "research_subquestion"),
+                       scheduled("3", "research_subquestion")):
+                yield ev
+
+    class Converter:
+        async def decode(self, payloads):
+            if len(payloads) and payloads[0].data == b"{}" and Converter.n == 0:
+                Converter.n += 1
+                return [{"index": 0, "text": "why?"}]
+            raise ValueError("undecodable")
+
+        n = 0
+
+    class FakeClient:
+        data_converter = Converter()
+
+    monkeypatch.setattr(web, "_labels", {})
+    got = await web._activity_labels(FakeClient(), Handle(), "wf", {"1", "2", "3"})
+    assert got["2"] == {"index": 0, "text": "why?"}
+    assert got["3"] == {} and got["1"] == {}        # a bad payload costs a label, not the page
+    await web._activity_labels(FakeClient(), Handle(), "wf", {"2"})
+    assert Handle.calls == 1                       # labels are immutable, so history is read once
+
+
+def test_the_page_polls_the_worker_free_endpoint():
+    """The XSS guard (`test_the_page_never_uses_innerhtml`) covers this panel too: every
+    row is built with createElement and textContent."""
+    html = pathlib.Path("web/index.html").read_text()
+    assert "/activities" in html and "renderLive" in html

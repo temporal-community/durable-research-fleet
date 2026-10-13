@@ -814,3 +814,23 @@ dialog.learn h1 { font-size: 1.2rem; margin: 0 0 0.4rem; }
   }
   .pulse.hot { animation: none; }
 }
+
+/* Live recovery rows: what Temporal says about Activities that lost a worker. Hidden until
+   there is something to say, so the happy path stays quiet. */
+.live { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: 0.35rem; }
+.live[hidden] { display: none; }
+.live li {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.7rem;
+  padding: 0.45rem 0.7rem; border-radius: 6px; font-family: var(--mono); font-size: 0.74rem;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  color: var(--ink);
+}
+.live li b { font-weight: 600; }
+.live .live-attempt { color: var(--muted); }
+.live .live-what { color: var(--warn); }
+.live li.live-running {
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: color-mix(in srgb, var(--ok) 8%, transparent);
+}
+.live li.live-running .live-what { color: var(--ok); }
