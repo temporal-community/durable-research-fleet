@@ -60,6 +60,7 @@ logger = logging.getLogger("agentcore-runtime")
 REQUIRED_SECRETS = ("TEMPORAL_API_KEY",)
 OPTIONAL_SECRETS = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY")
 SECRET_ENV_NAMES = REQUIRED_SECRETS + OPTIONAL_SECRETS
+_OPTIONAL_LABELS = {"GEMINI_API_KEY": "Gemini", "ANTHROPIC_API_KEY": "Anthropic"}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -103,8 +104,14 @@ def resolve_secrets(
         except Exception as exc:
             if not optional:
                 raise
-            # The exception text can quote the ARN but never the value.
-            logger.warning("optional secret %s unavailable (%s); continuing without it", name, exc)
+            # Log a fixed provider label and the exception CLASS only: no secret-bearing
+            # name or message text reaches the log (the value is never in `exc`, but a
+            # scanner cannot know that, and the class is enough to diagnose).
+            logger.warning(
+                "optional %s secret unavailable (%s); continuing without it",
+                _OPTIONAL_LABELS[name],
+                type(exc).__name__,
+            )
             continue
         os.environ[name] = value
         filled.append(name)
