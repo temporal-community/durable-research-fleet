@@ -417,11 +417,14 @@ async def test_labels_are_read_from_history_once_and_survive_a_bad_payload(monke
     assert Handle.calls == 1                       # labels are immutable, so history is read once
 
 
-def test_the_page_polls_the_worker_free_endpoint():
-    """The XSS guard (`test_the_page_never_uses_innerhtml`) covers this panel too: every
-    row is built with createElement and textContent."""
+def test_the_page_leaves_attempt_counts_to_temporal_cloud():
+    """Two screens counting attempts on different refresh cadences only disagree, so the page
+    shows no per-part attempt cards or numbers. It keeps the worker-free endpoint for ONE
+    stage line, used while the Query cannot answer."""
     html = pathlib.Path("web/index.html").read_text()
-    assert "/activities" in html and "renderLive" in html
+    assert "/activities" in html and "noteFrom" in html
+    for gone in ('id="live"', "renderLive", "chaosAttempt", "chaosRetrying", "highest attempt"):
+        assert gone not in html, gone
 
 
 # --------------------------------------------------------------- chaos panel

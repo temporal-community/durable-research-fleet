@@ -424,8 +424,10 @@ is the *configured* instance count, which is what `verify_stack.sh` reads. Time 
 - `RESEARCH_RETRY.maximum_attempts` went 6 -> 10 (~5 min of retrying), so a cut can last a minute
   and the part still finishes. The old test that waited the policy out would now take 5 minutes, so
   boundedness is asserted on the scheduled Activity in history.
-- **The page's live rows come from `GET /api/run/{id}/activities`, not the Query**, because a Query
-  needs a live Worker. Heartbeat RPCs are throttled by the SDK to ~80% of `heartbeat_timeout`
+- **The page shows NO per-part attempt numbers or cards: Temporal Cloud is the single source of truth
+  for retries** (two screens counting attempts on different refresh cadences only disagree). The page
+  keeps the footer summary and one stage line, fed by `GET /api/run/{id}/activities`, not the Query,
+  because a Query needs a live Worker. Heartbeat RPCs are throttled by the SDK to ~80% of `heartbeat_timeout`
   (48s of 60s), so a healthy Activity's server-side heartbeat is routinely 30-48s old: "silent" is
   only shown at 56s, and measured from the later of attempt start and last heartbeat.
 - **Durability credit counts each finished unit once, and never an interrupted part** (an interrupted

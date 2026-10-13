@@ -29,7 +29,8 @@
   </div>
   <p class="chaos-lede">
     Cut the route from the workers to the model API. The research calls fail, Temporal
-    retries them with backoff, and the page shows each attempt. Restore it and they finish.
+    retries them with backoff. Restore it and they finish. Open the run in Temporal Cloud to watch
+    every attempt, which is the source of truth for retries.
   </p>
   <div class="chaos-state" id="chaosState" data-cut="false">
     <span class="dot" aria-hidden="true"></span>
@@ -37,10 +38,6 @@
   </div>
   <button id="chaosToggle" class="chaos-toggle" disabled>Cut network</button>
   <p class="chaos-note" id="chaosNote">Ask a question first, then cut the network while it researches.</p>
-  <dl class="chaos-stats">
-    <div><dt>parts retrying</dt><dd id="chaosRetrying">0</dd></div>
-    <div><dt>highest attempt</dt><dd id="chaosAttempt">1</dd></div>
-  </dl>
   <p class="chaos-fine">
     This is fault injection: a Signal marks the run, and each Activity attempt fails while
     it is set. Retries, backoff and recovery are Temporal's own. Nothing real is broken.
@@ -144,7 +141,6 @@
       </div>
 
       <p class="err" id="runErr" role="alert"></p>
-      <ul class="live" id="live" aria-live="polite" hidden></ul>
       <div class="prose" id="prose"></div>
 
       <p class="hint" id="permalink" style="margin-top:1.4rem"></p>
@@ -617,15 +613,9 @@ function renderChaos() {
   t.disabled = chaosBusy || !runId;
   $('chaosNote').textContent = !runId
     ? 'Ask a question first, then cut the network while it researches.'
-    : netCut ? 'Watch the parts on the page: attempts climb as Temporal retries. Restore when you are ready.'
+    : netCut ? 'Each part is failing and being retried by Temporal. Watch the attempts in Temporal Cloud, then restore.'
              : 'Cut it while the parts are researching to see them fail and retry.';
   $('chaosBtn').classList.toggle('cut', netCut);
-}
-
-function renderChaosStats(acts) {
-  const retrying = acts.filter((a) => a.attempt > 1).length;
-  $('chaosRetrying').textContent = String(retrying);
-  $('chaosAttempt').textContent = String(acts.reduce((m, a) => Math.max(m, a.attempt), 1));
 }
 
 function showChaos(enabled) {
@@ -677,46 +667,13 @@ $('chaosToggle').addEventListener('click', toggleNetwork);
 // moment worth showing: a Worker died mid-Activity and nothing has been lost.
 let liveNote = '';
 
-function causeOf(a) {
-  if (a.outage) return 'network down, ';
-  return a.worker_lost ? 'worker lost, ' : '';
-}
-
-function liveSentence(a) {
-  const bits = [];
-  if (a.phase === 'silent') {
-    bits.push('no heartbeat for ' + Math.round(a.silent_for) + 's, the worker may be lost (Temporal gives up at 60s)');
-  } else if (a.phase === 'retry_wait') {
-    bits.push(causeOf(a) + 'retrying in ' + Math.ceil(a.retry_in) + 's');
-  } else if (a.phase === 'retrying') {
-    bits.push(causeOf(a) + 'waiting for a worker to take it');
-  } else if (a.attempt > 1) {
-    bits.push('running again');
-  }
-  if (a.attempt > 1 && a.has_checkpoint) bits.push('resuming from its checkpoint');
-  return bits.join(' · ');
-}
-
-function renderLive(acts) {
-  renderChaosStats(acts);
-  // Only the notable ones. A healthy first attempt is the happy path and would be noise.
-  const notable = acts.filter((a) => a.attempt > 1 || a.phase === 'silent');
-  const ul = $('live');
-  ul.hidden = notable.length === 0;
-  liveNote = '';
-  if (!notable.length) { ul.replaceChildren(); return; }
-  liveNote = notable.some((a) => a.outage) ? 'network down, retrying'
-    : notable.some((a) => a.phase === 'silent' || a.worker_lost) ? 'recovering from a lost worker'
-    : 'retrying';
-  const frag = document.createDocumentFragment();
-  notable.forEach((a) => {
-    const li = el('li', 'live-' + a.phase);
-    const name = a.index != null ? 'Part ' + (a.index + 1) : a.type;
-    li.append(el('b', '', name), el('span', 'live-attempt', 'attempt ' + a.attempt));
-    li.append(el('span', 'live-what', liveSentence(a)));
-    frag.append(li);
-  });
-  ul.replaceChildren(frag);
+// The page deliberately shows NO per-part attempt numbers or cards: Temporal Cloud is the single
+// source of truth for retries, and two screens counting attempts on different refresh cadences
+// only disagree. What the page keeps is one stage line, used while the Query cannot answer.
+function noteFrom(acts) {
+  if (acts.some((a) => a.outage)) return 'network down, retrying';
+  if (acts.some((a) => a.phase === 'silent' || a.worker_lost)) return 'recovering from a lost worker';
+  return acts.some((a) => a.attempt > 1) ? 'retrying' : '';
 }
 
 async function pollActivities() {
@@ -725,7 +682,7 @@ async function pollActivities() {
     const res = await fetch('/api/run/' + runId + '/activities');
     if (!res.ok) return;
     const d = await res.json();
-    renderLive(d.activities || []);
+    liveNote = noteFrom(d.activities || []);
   } catch { /* transient; the next tick retries */ }
 }
 
@@ -809,7 +766,7 @@ async function pollRun() {
       const f = byQuestion.get(text);
       // A finding on attempt > 1 lost its first worker and finished anyway.
       const survived = f && (f.attempt > 1 || f.resumed)
-        ? ' · survived a lost worker (attempt ' + f.attempt + (f.resumed ? ', resumed from checkpoint' : '') + ')'
+        ? ' · survived a lost worker' + (f.resumed ? ' (resumed from checkpoint)' : '')
         : '';
       li.lastElementChild.textContent = text + survived;
     }
