@@ -393,6 +393,24 @@ The upstream research app also demonstrated pool scale-out for a six-way fan-out
 the full plan → fan-out → draft → review → Signal lifecycle. Do not reuse its API
 latency, token, search, or cache measurements as Gemini baselines; remeasure them.
 
+**Cold start, measured 2026-10-13 (read this before tuning anything).** The "0 → 3 in 20s" above
+is the *configured* instance count, which is what `verify_stack.sh` reads. Time to first
+*poll* is ~125s, from the Cloud Audit Logs and worker logs of a real run:
+- WCI asked for `manualInstanceCount=1` within 1s of the Workflow starting; the first Worker polled
+  ~125-132s later. The same gap showed on the old revision during `make verify SCALE=1`
+  (request 09:26:52, first poll 09:29:04) and on a brand-new one, so it is **not a revision cost**:
+  the new revision was ready in 1.48s.
+- Inside that, the container itself is ~6s (startup probe to first poll). Imports, image contents
+  and bytecode are therefore worth seconds at most. Don't spend a day shrinking the image.
+- The WCI keeps adding while nothing polls yet: 1 → 5 → 9 → 10 → 14 instances for 6 sub-questions,
+  and 12 for 5 hello Workflows. Expect overshoot on a cold start.
+- It scales in slowly, about one instance a minute (12 → 5 took ~11 minutes), so a second question
+  within a few minutes starts instantly. That is why back-to-back runs looked fast.
+- The documented `--gcp-cloud-run-scale-down-stabilization-duration` flag is in NEITHER the pinned
+  main CLI nor `temporal` 1.9.1 here (`update-version-compute-config --help`), so it cannot be set yet.
+- **What helps the room: `./fleet warm`** (Cloud Run: raises the pool; AgentCore: starts a hello
+  Workflow) a few minutes before the first question. AgentCore's cold start is ~17-20s.
+
 **`egress = "PRIVATE_RANGES_ONLY"` on the pool is load-bearing for the research
 app.** Private traffic reaches the Temporal VM at `10.10.0.10:7233` through the VPC,
 while `generativelanguage.googleapis.com` goes out over Cloud Run's default internet
