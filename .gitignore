@@ -31,3 +31,7 @@ decisions/
 # AgentCore stack: same rules as terraform/ (state holds role ARNs and the external id).
 agentcore/.terraform/
 agentcore/build/
+
+# fleet CLI: per-developer config and remembered target
+fleet.toml
+.fleet/

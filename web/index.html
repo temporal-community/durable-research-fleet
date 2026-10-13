@@ -724,7 +724,9 @@ async function pollFleet() {
   $('pulse').className = 'pulse' + (f.workers > 0 ? ' hot' : '');
 
   peakSeen = Math.max(peakSeen, f.peak || 0, f.workers || 0);
-  $('railPeak').textContent = 'peak ' + peakSeen + ' · ' + f.started + ' spawned this session';
+  // The platform line comes from `fleet run`; absent when the console was started by hand.
+  $('railPeak').textContent = 'peak ' + peakSeen + ' · ' + f.started + ' spawned this session' +
+    (f.target ? ' · ' + f.target + ' · ' + f.namespace : '');
 
   // Ring buffer. Client-side only, so it resets on reload — the right scope for a
   // demo, and it means no server change to show the SHAPE of the burst.

@@ -397,6 +397,9 @@ async def _read_fleet() -> dict:
         "workflows_running": running,
         "backlog": backlog,
         "task_queue": TASK_QUEUE,
+        # Set by `fleet run`; empty when the console was started some other way.
+        "target": os.environ.get("FLEET_TARGET", ""),
+        "namespace": NAMESPACE,
     }
 
 

@@ -1,0 +1,17 @@
+# Copy to fleet.toml (gitignored). Holds NO secrets: keys stay in .env / Secrets Manager.
+# Every section is optional; the AgentCore Namespace falls back to agentcore/terraform.tfvars.
+
+[defaults]
+worker = "local"          # local | cloudrun | agentcore  (`fleet use <worker>` overrides)
+
+[cloudrun]
+project = "your-gcp-project"
+region = "us-central1"
+zone = "us-central1-a"
+prefix = "research-fleet"   # also the Worker Deployment name
+build_id = "v1"
+frontend_port = 7233        # local end of `fleet tunnel`
+
+[agentcore]
+namespace = "your-namespace.a1b2c"   # a Temporal Cloud Namespace with AgentCore enabled
+# deployment = "research-fleet-agentcore"

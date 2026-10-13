@@ -265,3 +265,9 @@ def test_the_page_names_no_single_compute_platform():
     page = (pathlib.Path(__file__).parent.parent / "web" / "index.html").read_text()
     for platform in ("Cloud Run", "AgentCore", "Lambda"):
         assert platform not in page, f"index.html names {platform}; keep the copy platform-neutral"
+
+
+def test_fleet_payload_names_the_platform(monkeypatch):
+    """`fleet run` exports FLEET_TARGET so the footer can say which platform is live."""
+    src = inspect.getsource(web._read_fleet)
+    assert '"target"' in src and "FLEET_TARGET" in src and '"namespace"' in src
