@@ -35,6 +35,23 @@ Pick one per deployment. Everything above the compute layer is identical, and bo
 
 **Pick Cloud Run** if you want the headline "one Worker per sub-question" picture on a projector and are comfortable self-hosting the pre-release Temporal server. **Pick AgentCore** if you already use Temporal Cloud on AWS and want no servers at rest; expect a smaller, less predictable worker count.
 
+### 🎛 One CLI, either platform
+
+The app is identical on both platforms; `--worker` only picks where the console and starter talk. Nothing is deployed or changed by switching.
+
+```bash
+cp fleet.toml.example fleet.toml          # per-developer config, gitignored, no secrets
+./fleet targets                           # what each platform points at
+./fleet doctor -w agentcore               # tools, keys, Temporal reachable, deployment exists
+./fleet run -w agentcore                  # the console against Temporal Cloud
+./fleet tunnel & ./fleet run -w cloudrun  # the console against the self-hosted VM
+./fleet ask "How do heat pumps work?" -w agentcore -p gemini
+./fleet status | verify | up | ship | down   # all take -w and --dry-run
+./fleet use agentcore                     # make it the default
+```
+
+Ambient `TEMPORAL_*` variables are ignored on purpose, so a shell left on Temporal Cloud cannot redirect a Cloud Run command. `ship` encodes the sharp edges (retained build ids, the digest redeploy, no deploy while Workflows are running); `down` needs `--confirm <platform>`.
+
 ### ✨ Key demo moments
 
 | Moment | What happens | Why it matters |

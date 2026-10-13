@@ -66,6 +66,10 @@ size, and it forced `sys.path` juggling in both Workers. Don't re-introduce
   `heartbeat_timeout` + `RetryPolicy`
 - ✅ `activities.py` — `say_hello`, one 5s sleep. The sleep is load-bearing: without
   it there's no backlog, so nothing for the WCI to scale on. `GREETING_SECONDS`.
+- ✅ `fleet` / `fleet.py` / `targets.py` — **the platform switch.** `./fleet <cmd> -w local|cloudrun|agentcore`. A thin
+  stdlib dispatcher over Make, `agentcore/*.sh` and the `temporal` CLI; `targets.py` resolves what each platform
+  points at and imports no `temporalio`. Ambient `TEMPORAL_*` env is deliberately dropped from child processes.
+  Per-developer values live in gitignored `fleet.toml`. Don't re-implement Make logic in it.
 - ✅ `starter.py` — starts hello Workflows; `--watch`, `--count N` for burst mode
 - ✅ `worker_local.py` / `worker_cloudrun.py` — register **both** apps; ~12 lines each
 - ✅ `Dockerfile` — **one image, two entrypoints.** `CMD` is the Worker; the Cloud Run
@@ -127,7 +131,7 @@ Infra identifiers are `research-fleet` (prefix, deployment name) and
 stack** — the names are baked into every resource — so don't do it casually; the
 2026-07-29 pass cost a full teardown, a fresh VM bootstrap and a new demo URL.
 
-> **AgentCore target added 2026-10-05** (branch `feat/agentcore-serverless-worker`):
+> **AgentCore target added 2026-10-05** (merged to `main` 2026-10-13, PR #4):
 > the same two apps can run as Temporal Serverless Workers on Amazon Bedrock AgentCore
 > Runtime against ONE Temporal Cloud Namespace. Read `docs/AGENTCORE.md`. It is
 > offline-tested (152 Python tests plus `make test-ac`) and **verified live on 2026-10-05**:
@@ -434,9 +438,8 @@ Research app (full reasoning in `decisions/05-research-agent.md`):
 - **Both search tools are server-side.** Gemini uses Google Search grounding and
   Claude uses Anthropic web search. Do not add a local scraper or client-side tool
   loop unless the architecture is deliberately being changed.
-- **Provider choice is request-scoped Workflow input.** On the AgentCore branch the UI and
-  `llm.DEFAULT_PROVIDER` default to Claude (2026-10-05); `main` still defaults to Gemini, so
-  merging flips the GCP demo's default. Changing the default is a code change to Workflow
+- **Provider choice is request-scoped Workflow input.** Since the AgentCore merge the UI and
+  `llm.DEFAULT_PROVIDER` default to Claude (2026-10-05); the merge flipped the GCP demo's default from Gemini. Changing the default is a code change to Workflow
   code, so ship it under a new Build ID.
   Do not replace it with `RESEARCH_PROVIDER`; ambient configuration could switch a
   retry or replay to a different model than the one recorded when the run started.
