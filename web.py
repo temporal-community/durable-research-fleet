@@ -22,6 +22,7 @@ permission on a page anyone in the room can POST to.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -56,6 +57,10 @@ ASKS_PER_MINUTE_PER_IP = 3
 # CASE-INSENSITIVE on purpose: phone keyboards auto-capitalise the first letter, so a
 # case-sensitive check rejects most of the room on their first try.
 DEMO_PASSCODE = os.environ.get("DEMO_PASSCODE", "").strip()
+# The chaos panel's "cut network" button. OFF unless the process is started with FLEET_CHAOS=1,
+# which only `fleet run --chaos` does. Terraform never sets it, so the deployed web tier has no
+# such endpoint (guarded by test_the_deployed_web_tier_never_enables_chaos).
+CHAOS_ENABLED = os.environ.get("FLEET_CHAOS", "") == "1"
 # Must equal llm.DEFAULT_PROVIDER (web.py cannot import llm); test_web pins the pair.
 DEFAULT_PROVIDER = "anthropic"
 PROVIDERS = frozenset({"gemini", "anthropic"})
@@ -262,6 +267,224 @@ async def run_state(workflow_id: str) -> JSONResponse:
     return JSONResponse(state)
 
 
+# --------------------------------------------------------------- live activities
+#
+# `/api/run/{id}` is a Query, and a Query needs a live Worker. After a Worker is killed
+# mid-Activity there may be NONE for a while, which is exactly when an audience wants to see
+# what Temporal is doing about it. `DescribeWorkflowExecution` is answered by the Temporal
+# service itself, so it works with zero Workers and carries the retry state: attempt,
+# last failure, worker identity, heartbeat age, next retry time.
+#
+# Seconds without a heartbeat before an Activity is shown as silent. NOT the Worker's beat
+# interval: the SDK throttles heartbeat RPCs to one per ~80% of heartbeat_timeout (48s of the
+# 60s here), so the server-side timestamp of a perfectly healthy Activity is routinely 30-48s
+# old. A 20s threshold flagged every healthy part as silent (seen live). 56s sits just inside
+# the 60s timeout, so "silent" only appears when Temporal is about to give up on it.
+HEARTBEAT_SILENT_SECONDS = 56.0
+ACTIVITIES_TTL_SECONDS = 1.0
+LABELS_MAX_RUNS = 128
+
+_activities_cache: dict[str, tuple[float, dict]] = {}
+# Activity ids are immutable once scheduled, so a label is looked up once per run.
+_labels: dict[str, dict[str, dict]] = {}
+
+
+def _short_failure(message: str | None, limit: int = 160) -> str | None:
+    if not message:
+        return None
+    one_line = " ".join(message.split())
+    return one_line if len(one_line) <= limit else one_line[: limit - 1] + "…"
+
+
+def _ts_seconds(ts) -> float | None:
+    """Seconds since epoch for a protobuf Timestamp, or None when unset."""
+    if ts is None or (ts.seconds == 0 and ts.nanos == 0):
+        return None
+    return ts.seconds + ts.nanos / 1e9
+
+
+def _has_resumable_checkpoint(details) -> bool:
+    """True only if the last heartbeat carries real progress, not just liveness.
+
+    EVERY heartbeat carries details (the timer beat sends the whole Checkpoint), so
+    "non-empty" says nothing. A Claude Activity has something to resume from only after a
+    pause_turn round completed: `partial_summary` filled and `rounds_done` > 0.
+    """
+    for payload in details.payloads:
+        try:
+            data = json.loads(payload.data)
+        except Exception:
+            continue
+        if isinstance(data, dict) and (data.get("partial_summary") or data.get("rounds_done")):
+            return True
+    return False
+
+
+def describe_pending_activities(pending, labels: dict[str, dict], now: float) -> list[dict]:
+    """Turn raw PendingActivityInfo protos into what the page shows.
+
+    `phase` is derived, not reported by Temporal:
+      queued     first attempt, waiting for a Worker
+      running    on a Worker and heartbeating
+      silent     on a Worker but no heartbeat for HEARTBEAT_SILENT_SECONDS: the Worker may
+                 be gone, and Temporal will say so when the heartbeat timeout fires
+      retry_wait attempt > 1 and inside the retry backoff
+      retrying   attempt > 1, backoff over, waiting for a Worker to pick it up
+    """
+    out = []
+    for pa in pending:
+        started = _ts_seconds(pa.last_started_time) if pa.HasField("last_started_time") else None
+        beat = _ts_seconds(pa.last_heartbeat_time) if pa.HasField("last_heartbeat_time") else None
+        next_at = (
+            _ts_seconds(pa.next_attempt_schedule_time)
+            if pa.HasField("next_attempt_schedule_time")
+            else None
+        )
+        failure = _short_failure(pa.last_failure.message) if pa.HasField("last_failure") else None
+        # PENDING_ACTIVITY_STATE_STARTED == 2: the only state with a Worker holding it.
+        on_worker = int(pa.state) == 2
+        # A retry inherits the PREVIOUS attempt's heartbeat timestamp, so measure from whichever
+        # is newer: this attempt's start or its latest heartbeat. Using the stale one flagged
+        # every freshly restarted part as silent right after the network was restored.
+        last_sign = max(t for t in (beat, started) if t) if (beat or started) else None
+        silent_for = max(0.0, now - last_sign) if on_worker and last_sign else None
+
+        if on_worker:
+            phase = "silent" if silent_for is not None and silent_for >= HEARTBEAT_SILENT_SECONDS else "running"
+        elif pa.attempt > 1:
+            phase = "retry_wait" if next_at and next_at > now else "retrying"
+        else:
+            phase = "queued"
+
+        label = labels.get(pa.activity_id, {})
+        out.append(
+            {
+                "activity_id": pa.activity_id,
+                "type": pa.activity_type.name,
+                "index": label.get("index"),
+                "text": label.get("text"),
+                "phase": phase,
+                "attempt": pa.attempt,
+                "worker": pa.last_worker_identity or None,
+                "last_failure": failure,
+                # An abrupt Worker loss surfaces as a heartbeat timeout on the NEXT attempt's
+                # `last_failure`, which is the clearest "a Worker died" signal Temporal gives.
+                "worker_lost": bool(failure and "heartbeat" in failure.lower()),
+                # The console's own fault injection, so the page can say "network down" and
+                # not "worker lost" for what it caused.
+                "outage": bool(failure and "simulated network outage" in failure.lower()),
+                # Heartbeat details persist across attempts: non-empty means the retry has a
+                # checkpoint to resume from (Claude only; Gemini heartbeats carry liveness).
+                "has_checkpoint": _has_resumable_checkpoint(pa.heartbeat_details),
+                "silent_for": None if silent_for is None else round(silent_for, 1),
+                "retry_in": round(next_at - now, 1) if next_at and next_at > now else None,
+            }
+        )
+    out.sort(key=lambda a: (a["index"] is None, a["index"] if a["index"] is not None else 0, a["activity_id"]))
+    return out
+
+
+async def _activity_labels(client: Client, handle, workflow_id: str, wanted: set[str]) -> dict[str, dict]:
+    """activity_id -> {index, text} for research sub-questions, read from the history once."""
+    known = _labels.get(workflow_id)
+    if known is None:
+        if len(_labels) >= LABELS_MAX_RUNS:
+            _labels.pop(next(iter(_labels)), None)
+        known = _labels[workflow_id] = {}
+    if wanted <= known.keys():
+        return known
+    try:
+        async for event in handle.fetch_history_events():
+            if not event.HasField("activity_task_scheduled_event_attributes"):
+                continue
+            attrs = event.activity_task_scheduled_event_attributes
+            if attrs.activity_id in known:
+                continue
+            label: dict = {}
+            if attrs.activity_type.name == "research_subquestion":
+                try:
+                    args = await client.data_converter.decode(attrs.input.payloads)
+                    sub = args[0] if args else {}
+                    label = {"index": sub.get("index"), "text": sub.get("text")}
+                except Exception as exc:  # a label is a nicety; never fail the page for one
+                    logger.info("could not decode activity input for %s: %s", workflow_id, exc)
+            known[attrs.activity_id] = label
+            if wanted <= known.keys():
+                break
+    except Exception as exc:
+        logger.info("history read for labels failed for %s: %s", workflow_id, exc)
+    return known
+
+
+@app.get("/api/run/{workflow_id}/activities")
+async def run_activities(workflow_id: str) -> JSONResponse:
+    """What Temporal itself says is in flight, with no Worker needed.
+
+    404 means no such run; anything else transient is 503, same contract as `/api/run/{id}`.
+    """
+    now_mono = time.monotonic()
+    hit = _activities_cache.get(workflow_id)
+    if hit is not None and now_mono - hit[0] < ACTIVITIES_TTL_SECONDS:
+        return JSONResponse(hit[1])
+
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        desc = await handle.describe()
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="No such run.") from exc
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+    except Exception as exc:
+        logger.info("describe %s failed: %s", workflow_id, exc)
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+
+    pending = list(desc.raw_description.pending_activities)
+    labels = await _activity_labels(client, handle, workflow_id, {pa.activity_id for pa in pending}) if pending else {}
+    payload = {
+        "status": desc.status.name if desc.status else "UNKNOWN",
+        "activities": describe_pending_activities(pending, labels, time.time()),
+    }
+    _activities_cache[workflow_id] = (now_mono, payload)
+    if len(_activities_cache) > REVIEW_CACHE_MAX:
+        _activities_cache.pop(min(_activities_cache, key=lambda k: _activities_cache[k][0]), None)
+    return JSONResponse(payload)
+
+
+@app.post("/api/run/{workflow_id}/network")
+async def cut_network(workflow_id: str, request: Request) -> dict:
+    """Chaos panel: cut or restore the model-API route for ONE run.
+
+    It signals the Workflow, which flags its memo; each Activity attempt then fails while the
+    flag is set and Temporal retries it. Nothing here touches a Worker or a network device.
+
+    Disabled (404, indistinguishable from no such route) unless FLEET_CHAOS=1, and passcode
+    guarded like every other action that changes a run.
+    """
+    if not CHAOS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found.")
+    body = await request.json()
+    if not _passcode_ok(body.get("passcode")):
+        raise HTTPException(status_code=403, detail="Wrong passcode.")
+    cut = body.get("cut")
+    if not isinstance(cut, bool):
+        raise HTTPException(status_code=400, detail="cut must be true or false")
+
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        await handle.signal("network", cut)
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="No such run.") from exc
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+    # The flag changed what the page should show, so drop anything cached about this run.
+    _activities_cache.pop(workflow_id, None)
+    _review_cache.pop(workflow_id, None)
+    logger.info("network %s for %s", "CUT" if cut else "restored", workflow_id)
+    return {"ok": True, "cut": cut}
+
+
 @app.post("/api/run/{workflow_id}/decision")
 async def decide(workflow_id: str, request: Request) -> dict:
     """Send the review Signal — the event that wakes a pool sitting at zero.
@@ -400,6 +623,7 @@ async def _read_fleet() -> dict:
         # Set by `fleet run`; empty when the console was started some other way.
         "target": os.environ.get("FLEET_TARGET", ""),
         "namespace": NAMESPACE,
+        "chaos": CHAOS_ENABLED,
     }
 
 

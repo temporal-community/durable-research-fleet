@@ -506,15 +506,14 @@ async def test_credit_fires_on_a_RETRY_not_only_on_a_resume(
     Activity `attempt` fixes it, because that is what actually increments when
     pool-level scale-in kills an Activity.
 
-    Every sub-question is marked retried, which makes the expectation
-    ORDER-INDEPENDENT: whichever order the findings land in, the k-th to land has k
-    siblings already banked, so the total is 0+1+...+(n-1) = n(n-1)/2. Marking a
-    single one would be flaky — if the interrupted sub-question happened to complete
-    first there was genuinely nothing banked yet to protect.
+    ONE sub-question is retried and the rest run clean, so every clean sibling is work
+    that survived. Which order they land in decides how many were banked before the
+    retried one finished, so the assertion is a bound, not a number: it is flaky to
+    assert an exact count, and the counter must never exceed what was actually clean.
     """
-    n = 3
+    n = 4
     # Interrupted, but with NO checkpoint to resume from — the real-world shape.
-    acts, _ = _mocks(n_subs=n, retried=set(range(n)))
+    acts, _ = _mocks(n_subs=n, retried={0})
     async with research_worker(acts):
         handle = await env.client.start_workflow(
             ResearchWorkflow.run, "q", id=wf_id, task_queue=TASK_QUEUE
@@ -526,13 +525,36 @@ async def test_credit_fires_on_a_RETRY_not_only_on_a_resume(
     assert all(not f["resumed"] for f in state["findings"]), (
         "this test's whole point is that nothing resumed from a checkpoint"
     )
-    assert all(f["attempt"] == 2 for f in state["findings"])
+    dur = state["durability"]
+    assert dur["interruptions"] == 1
+    assert 0 <= dur["saved_subquestions"] <= n - 1
+
+
+async def test_an_outage_that_interrupts_every_part_credits_nothing_twice(
+    env, research_worker, wf_id
+):
+    """REGRESSION, seen live with the console's network cut: every part was interrupted and
+    the footer read "15 sub-questions not redone" on a run with 6.
+
+    An interrupted part WAS redone, so it is not work that survived, and a finished unit is
+    credited once however many parts are interrupted after it. With every part interrupted
+    there is nothing to credit but the plan.
+    """
+    n = 4
+    acts, _ = _mocks(n_subs=n, retried=set(range(n)))
+    async with research_worker(acts):
+        handle = await env.client.start_workflow(
+            ResearchWorkflow.run, "q", id=wf_id, task_queue=TASK_QUEUE
+        )
+        state = await _wait_for_stage(handle, "awaiting_review")
+        await handle.signal("review", args=["accept", ""])
+        await handle.result()
+
     dur = state["durability"]
     assert dur["interruptions"] == n
-    assert dur["saved_subquestions"] == n * (n - 1) // 2, (
-        "a retried sub-question must earn credit even with no checkpoint to resume "
-        "from — otherwise the counter reads 0 during the demo"
-    )
+    assert dur["saved_subquestions"] == 0
+    assert dur["saved_searches"] == 0
+    assert dur["saved_subquestions"] <= state["total"]
 
 
 async def test_no_interruptions_means_no_credit(env, research_worker, wf_id):
@@ -554,13 +576,123 @@ async def test_no_interruptions_means_no_credit(env, research_worker, wf_id):
     }
 
 
+# --- simulated network outage ---------------------------------------------
+
+
+async def test_the_network_signal_is_visible_in_the_query_and_in_the_memo(
+    env, research_worker, wf_id
+):
+    """The memo is how Activities on ANY platform read the flag with no Worker involved."""
+    from research_types import NETWORK_MEMO_KEY
+
+    acts, _ = _mocks(n_subs=1)
+    async with research_worker(acts):
+        handle = await env.client.start_workflow(
+            ResearchWorkflow.run, "q", id=wf_id, task_queue=TASK_QUEUE
+        )
+        first = await _wait_for_stage(handle, "awaiting_review")
+        assert first["network_cut"] is False
+
+        await handle.signal("network", True)
+        assert (await handle.query("progress"))["network_cut"] is True
+        assert (await (await handle.describe()).memo())[NETWORK_MEMO_KEY] is True
+
+        await handle.signal("network", False)
+        assert (await handle.query("progress"))["network_cut"] is False
+        assert (await (await handle.describe()).memo())[NETWORK_MEMO_KEY] is False
+
+        await handle.signal("review", args=["accept", ""])
+        await handle.result()
+
+
+async def test_a_cut_network_keeps_the_retry_loop_alive_and_restoring_it_finishes(
+    env, settings, wf_id, monkeypatch
+):
+    """The console's chaos panel, end to end with the REAL research Activity.
+
+    Only the model is stubbed. Six parts are mid-call, each with a Claude checkpoint, on six
+    slots, when the Signal arrives. Every attempt must be abandoned and retried by Temporal
+    while the network stays cut (so the attempt counter keeps climbing for ALL of them), and
+    every part must finish once it is restored. Six at once matters: it is what the live run
+    does, and a retry loop that works for one part can still stall for six.
+    """
+    import dataclasses
+
+    import llm
+    import research_activities as ra
+
+    monkeypatch.setattr(ra, "NETWORK_POLL_SECONDS", 0.2)
+    restored = asyncio.Event()
+    calls = []
+
+    async def model(**kw):
+        calls.append(1)
+        progress = kw.get("on_progress")
+        if progress:                              # a completed pause_turn round: a checkpoint
+            progress(llm.LLMResult(text="partial findings", rounds=1,
+                                   usage=Usage(input_tokens=1, output_tokens=1)))
+        if not restored.is_set():
+            await asyncio.sleep(120)              # the in-flight request the cut abandons
+        return llm.LLMResult(text="done", usage=Usage(input_tokens=1, output_tokens=1))
+
+    monkeypatch.setattr(llm, "complete", model)
+    n = 6
+    plan_act, _, synth_act = _mocks(n_subs=n)[0]
+    wide = dataclasses.replace(settings, max_concurrent_activities=n)
+    worker = runtime.build_worker(
+        env.client, [ResearchWorkflow], [plan_act, ra.research_subquestion, synth_act], wide
+    )
+
+    async with worker:
+        await make_current(env.client, settings.deployment_name, settings.build_id)
+        handle = await env.client.start_workflow(
+            ResearchWorkflow.run,
+            {"question": "q", "provider": "anthropic"},
+            id=wf_id,
+            task_queue=TASK_QUEUE,
+        )
+        deadline = time.monotonic() + 30
+        while len(calls) < n and time.monotonic() < deadline:   # every part is mid-call
+            await asyncio.sleep(0.1)
+        assert len(calls) >= n
+        await asyncio.sleep(1.0)                  # let the checkpoints reach the server
+
+        await handle.signal("network", True)
+
+        # Temporal keeps retrying while the network stays cut: every pending Activity's attempt
+        # counter climbs and names the outage as its last failure.
+        lowest = 0
+        seen_outage = False
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and lowest < 5:
+            pending = (await handle.describe()).raw_description.pending_activities
+            if len(pending) == n:
+                lowest = min(pa.attempt for pa in pending)
+                seen_outage |= all("Simulated network outage" in pa.last_failure.message for pa in pending if pa.attempt > 1)
+            await asyncio.sleep(0.25)
+        assert lowest >= 5, f"the retry loop stalled for at least one part (lowest attempt {lowest})"
+        assert seen_outage
+
+        restored.set()
+        await handle.signal("network", False)
+        state = await _wait_for_stage(handle, "awaiting_review", timeout=90)
+        assert state["done"] == n and not state["failed"]
+        await handle.signal("review", args=["accept", ""])
+        await handle.result()
+
+
 # --- failure handling -----------------------------------------------------
 
 
-async def test_a_permanently_failing_activity_fails_the_workflow(
+async def test_retries_are_bounded_and_a_non_retryable_failure_fails_fast(
     env, settings, wf_id
 ):
-    """Retries must be bounded, or one bad sub-question pins a pool instance."""
+    """Retries must be bounded, or one bad sub-question pins a pool instance.
+
+    Asserted on what reached the server, not by waiting the policy out: the policy rides out a
+    ~5 minute outage (10 attempts, 60s ceiling), so exhausting it for real would make this test
+    take that long. A failure marked non-retryable must still fail the Workflow immediately.
+    """
 
     @activity.defn(name="plan_research")
     async def plan(question: str, provider: str) -> ResearchPlan:
@@ -568,7 +700,7 @@ async def test_a_permanently_failing_activity_fails_the_workflow(
 
     @activity.defn(name="research_subquestion")
     async def always_fails(sub: SubQuestion, provider: str) -> Finding:
-        raise ApplicationError("permanent")
+        raise ApplicationError("permanent", non_retryable=True)
 
     @activity.defn(name="synthesize")
     async def synth(question: str, findings: list[Finding], provider: str) -> Answer:
@@ -583,6 +715,17 @@ async def test_a_permanently_failing_activity_fails_the_workflow(
             await env.client.execute_workflow(
                 ResearchWorkflow.run, "q", id=wf_id, task_queue=TASK_QUEUE
             )
+
+    scheduled = [
+        e.activity_task_scheduled_event_attributes
+        async for e in env.client.get_workflow_handle(wf_id).fetch_history_events()
+        if e.HasField("activity_task_scheduled_event_attributes")
+        and e.activity_task_scheduled_event_attributes.activity_type.name
+        == "research_subquestion"
+    ]
+    assert len(scheduled) == 1
+    attempts = scheduled[0].retry_policy.maximum_attempts
+    assert 1 < attempts <= 12, "retries must be finite, and long enough to ride out an outage"
 
 
 # --- replay --------------------------------------------------------------

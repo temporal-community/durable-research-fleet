@@ -14,9 +14,35 @@
   <img src="/temporal-logo.svg" alt="Temporal" width="76" height="55">
   <span class="what">serverless workers</span>
   <span class="spacer"></span>
+  <button class="plain chaos-btn" id="chaosBtn" hidden aria-controls="chaos" aria-expanded="false">Chaos</button>
   <button class="plain" id="learnBtn">Learn</button>
   <span class="pulse" id="pulse" aria-hidden="true"></span>
 </header>
+
+<!-- Chaos panel. Only reachable when the console was started with `fleet run --chaos`
+     (the server reports `chaos: true`); the deployed web tier never shows it. -->
+<aside class="chaos" id="chaos" hidden aria-labelledby="chaosTitle">
+  <div class="chaos-head">
+    <span class="label" id="chaosTitle">chaos · network</span>
+    <span style="flex:1"></span>
+    <button class="plain" id="chaosClose" aria-label="Close chaos panel">✕</button>
+  </div>
+  <p class="chaos-lede">
+    Cut the route from the workers to the model API. The research calls fail, Temporal
+    retries them with backoff. Restore it and they finish. Open the run in Temporal Cloud to watch
+    every attempt, which is the source of truth for retries.
+  </p>
+  <div class="chaos-state" id="chaosState" data-cut="false">
+    <span class="dot" aria-hidden="true"></span>
+    <span id="chaosStateText">network connected</span>
+  </div>
+  <button id="chaosToggle" class="chaos-toggle" disabled>Cut network</button>
+  <p class="chaos-note" id="chaosNote">Ask a question first, then cut the network while it researches.</p>
+  <p class="chaos-fine">
+    This is fault injection: a Signal marks the run, and each Activity attempt fails while
+    it is set. Retries, backoff and recovery are Temporal's own. Nothing real is broken.
+  </p>
+</aside>
 
 <main>
   <!-- ONE DOM. Nothing is removed, only hidden by [data-state], which is what lets
@@ -573,8 +599,96 @@ function runFailed(message) {
   $('runErr').textContent = message;
 }
 
+/* ------------------------------------------------------------ chaos panel */
+
+let chaosOn = false, netCut = false, chaosBusy = false;
+
+function renderChaos() {
+  const st = $('chaosState');
+  st.dataset.cut = String(netCut);
+  $('chaosStateText').textContent = netCut ? 'network cut: the model API is unreachable' : 'network connected';
+  const t = $('chaosToggle');
+  t.textContent = netCut ? 'Restore network' : 'Cut network';
+  t.classList.toggle('restore', netCut);
+  t.disabled = chaosBusy || !runId;
+  $('chaosNote').textContent = !runId
+    ? 'Ask a question first, then cut the network while it researches.'
+    : netCut ? 'Each part is failing and being retried by Temporal. Watch the attempts in Temporal Cloud, then restore.'
+             : 'Cut it while the parts are researching to see them fail and retry.';
+  $('chaosBtn').classList.toggle('cut', netCut);
+}
+
+function showChaos(enabled) {
+  if (enabled === chaosOn) return;
+  chaosOn = enabled;
+  $('chaosBtn').hidden = !enabled;
+  if (!enabled) $('chaos').hidden = true;
+}
+
+function toggleChaosPanel() {
+  const panel = $('chaos');
+  panel.hidden = !panel.hidden;
+  $('chaosBtn').setAttribute('aria-expanded', String(!panel.hidden));
+  renderChaos();
+}
+
+async function toggleNetwork() {
+  if (!runId || chaosBusy) return;
+  chaosBusy = true; renderChaos();
+  try {
+    const res = await fetch('/api/run/' + runId + '/network', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cut: !netCut, passcode: passcode() }),
+    });
+    if (res.ok) {
+      netCut = !netCut;
+      $('chaosNote').textContent = '';
+    } else {
+      const body = await res.json().catch(() => ({}));
+      $('chaosNote').textContent = body.detail || 'Could not change the network.';
+    }
+  } catch { $('chaosNote').textContent = 'Could not reach the console.'; }
+  chaosBusy = false;
+  const keep = $('chaosNote').textContent;
+  renderChaos();
+  if (keep) $('chaosNote').textContent = keep;
+  pollActivities();
+}
+
+$('chaosBtn').addEventListener('click', toggleChaosPanel);
+$('chaosClose').addEventListener('click', toggleChaosPanel);
+$('chaosToggle').addEventListener('click', toggleNetwork);
+
+/* ------------------------------------------------- what Temporal says is in flight */
+
+// `/api/run/{id}` is a Query, which needs a live Worker. `/api/run/{id}/activities` is answered
+// by the Temporal service itself, so it keeps working while every Worker is gone. That is the
+// moment worth showing: a Worker died mid-Activity and nothing has been lost.
+let liveNote = '';
+
+// The page deliberately shows NO per-part attempt numbers or cards: Temporal Cloud is the single
+// source of truth for retries, and two screens counting attempts on different refresh cadences
+// only disagree. What the page keeps is one stage line, used while the Query cannot answer.
+function noteFrom(acts) {
+  if (acts.some((a) => a.outage)) return 'network down, retrying';
+  if (acts.some((a) => a.phase === 'silent' || a.worker_lost)) return 'recovering from a lost worker';
+  return acts.some((a) => a.attempt > 1) ? 'retrying' : '';
+}
+
+async function pollActivities() {
+  if (!runId || finished) return;
+  try {
+    const res = await fetch('/api/run/' + runId + '/activities');
+    if (!res.ok) return;
+    const d = await res.json();
+    liveNote = noteFrom(d.activities || []);
+  } catch { /* transient; the next tick retries */ }
+}
+
 async function pollRun() {
   if (!runId) return;
+  pollActivities();   // not awaited: it must not delay, or depend on, the Query below
   let s;
   try {
     const res = await fetch('/api/run/' + runId);
@@ -589,8 +703,9 @@ async function pollRun() {
       return;
     }
     if (res.status === 503) {
-      // Name it rather than hiding it: no worker exists yet IS the demo.
-      $('stage').textContent = 'waiting for a worker';
+      // Name it rather than hiding it: no worker exists yet IS the demo. When Temporal
+      // itself says an Activity is being retried, say that instead of a bare "waiting".
+      $('stage').textContent = liveNote || 'waiting for a worker';
       $('stageDot').className = 'pulse hot';
       return;
     }
@@ -598,6 +713,11 @@ async function pollRun() {
     s = await res.json();
   } catch { return; }      // network blip: the next tick retries
   $('runErr').textContent = '';
+
+  if (typeof s.network_cut === 'boolean' && s.network_cut !== netCut && !chaosBusy) {
+    netCut = s.network_cut;   // the run is the source of truth, not this tab's last click
+    renderChaos();
+  }
 
   if (s.question && !$('qtitle').textContent) {
     $('qtitle').textContent = s.question;
@@ -611,6 +731,7 @@ async function pollRun() {
   // --- parts, as a tick strip plus a collapsed list
   const subs = s.sub_questions || [];
   const done = new Set((s.findings || []).map((f) => f.question));
+  const byQuestion = new Map((s.findings || []).map((f) => [f.question, f]));
   $('partsCount').textContent = (s.done || 0) + '/' + (s.total || 0);
   $('tabParts').textContent = subs.length ? String(subs.length) : '';
 
@@ -642,7 +763,12 @@ async function pollRun() {
     if (li) {
       li.className = cls;
       li.firstElementChild.textContent = ok ? '✓' : (active ? '▸' : '·');
-      li.lastElementChild.textContent = text;
+      const f = byQuestion.get(text);
+      // A finding on attempt > 1 lost its first worker and finished anyway.
+      const survived = f && (f.attempt > 1 || f.resumed)
+        ? ' · survived a lost worker' + (f.resumed ? ' (resumed from checkpoint)' : '')
+        : '';
+      li.lastElementChild.textContent = text + survived;
     }
   });
 
@@ -717,6 +843,7 @@ async function pollFleet() {
   let f;
   try { f = await (await fetch('/api/fleet')).json(); } catch { return; }
 
+  showChaos(!!f.chaos);
   setNum($('tWorkers'), f.workers);
   setNum($('tSpawned'), f.started);
   $('tWorkers').classList.toggle('zero', f.workers === 0);

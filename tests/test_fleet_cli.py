@@ -169,3 +169,10 @@ def test_warm_agentcore_starts_a_hello_workflow_not_a_research_one(root):
     _, rec, _ = go(root, ["warm", "-w", "agentcore"])
     argv = rec.argvs[0]
     assert "--type HelloWorkflow" in argv and "ResearchWorkflow" not in argv  # spends no model tokens
+
+
+def test_run_enables_the_chaos_panel_only_when_asked(root):
+    _, rec, _ = go(root, ["run", "-w", "agentcore"])
+    assert "FLEET_CHAOS" not in rec.calls[0][1]
+    _, rec, out = go(root, ["run", "-w", "agentcore", "--chaos"])
+    assert rec.calls[0][1]["FLEET_CHAOS"] == "1" and "chaos panel ON" in out

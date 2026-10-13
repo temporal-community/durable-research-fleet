@@ -411,6 +411,33 @@ is the *configured* instance count, which is what `verify_stack.sh` reads. Time 
 - **What helps the room: `./fleet warm`** (Cloud Run: raises the pool; AgentCore: starts a hello
   Workflow) a few minutes before the first question. AgentCore's cold start is ~17-20s.
 
+**Chaos panel (added 2026-10-13, branch `feat/crash-visibility`).** `fleet run --chaos` sets
+`FLEET_CHAOS=1`, which turns on `POST /api/run/{id}/network` and the Chaos button. Rules:
+- **Only `fleet run --chaos` may set `FLEET_CHAOS`.** Not Terraform, not the Dockerfile; guarded by
+  `test_the_deployed_web_tier_never_enables_chaos`. Without it the endpoint is a 404.
+- **Mechanism:** the `network` Signal sets `_State.network_cut` and upserts the Workflow memo
+  (`research_types.NETWORK_MEMO_KEY`). Activities read the memo through `DescribeWorkflowExecution`
+  (no Worker needed) at the start of each attempt, and `_heartbeating` watches it every
+  `RESEARCH_NETWORK_POLL_SECONDS` (default 3, 0 disables) and abandons an in-flight call with a
+  RETRYABLE `ApplicationError` (`SimulatedNetworkOutage`). `_network_is_cut` fails OPEN.
+- **It is a Workflow change**, so it ships under a new Build ID, and not while a Workflow awaits review.
+- `RESEARCH_RETRY.maximum_attempts` went 6 -> 10 (~5 min of retrying), so a cut can last a minute
+  and the part still finishes. The old test that waited the policy out would now take 5 minutes, so
+  boundedness is asserted on the scheduled Activity in history.
+- **The page shows NO per-part attempt numbers or cards: Temporal Cloud is the single source of truth
+  for retries** (two screens counting attempts on different refresh cadences only disagree). The page
+  keeps the footer summary and one stage line, fed by `GET /api/run/{id}/activities`, not the Query,
+  because a Query needs a live Worker. Heartbeat RPCs are throttled by the SDK to ~80% of `heartbeat_timeout`
+  (48s of 60s), so a healthy Activity's server-side heartbeat is routinely 30-48s old: "silent" is
+  only shown at 56s, and measured from the later of attempt start and last heartbeat.
+- **Durability credit counts each finished unit once, and never an interrupted part** (an interrupted
+  part was redone). Before this, a cut that interrupted all 6 parts showed "15 sub-questions not redone".
+- Tested live on a local dev server with real Claude: cut -> all 6 parts failed with the outage,
+  attempts climbed, restore -> finished, 0 failures. **Open:** in one run the 4th attempt of all 6
+  parts sat unstarted (`retrying`) for ~25s while the network was still cut and only started after
+  restore. Not reproducible on the test server (six parts, real checkpoints, same policy). Investigate
+  with an instrumented live run before relying on the exact attempt cadence on stage.
+
 **`egress = "PRIVATE_RANGES_ONLY"` on the pool is load-bearing for the research
 app.** Private traffic reaches the Temporal VM at `10.10.0.10:7233` through the VPC,
 while `generativelanguage.googleapis.com` goes out over Cloud Run's default internet

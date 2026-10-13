@@ -53,10 +53,12 @@ class Ctx:
     def say(self, text: str = "") -> None:
         print(text, file=self.out, flush=True)
 
-    def run(self, argv: list[str], *, capture: bool = False, mutates: bool = True) -> tuple[int, str]:
+    def run(self, argv: list[str], *, capture: bool = False, mutates: bool = True,
+            extra_env: dict[str, str] | None = None) -> tuple[int, str]:
         """Run with the TARGET's env. A dry run prints mutating commands and skips them;
         read-only ones (`mutates=False`) still run so a dry run can show real state."""
         env = T.child_env(self.env, self.target, self.root)
+        env.update(extra_env or {})
         if self.dry_run and mutates:
             self.say("  would run: " + " ".join(argv))
             return 0, ""
@@ -140,7 +142,9 @@ def cmd_run(ctx: Ctx, args) -> int:
     argv = [sys.executable, "-m", "uvicorn", "web:app", "--port", str(args.port), "--no-proxy-headers"]
     if args.reload:
         argv.append("--reload")
-    return ctx.run(argv)[0]
+    if args.chaos:
+        ctx.say("chaos panel ON: the console can cut the model-API route for a run (this process only)")
+    return ctx.run(argv, extra_env={"FLEET_CHAOS": "1"} if args.chaos else None)[0]
 
 
 def provider_name(raw: str) -> str:
@@ -434,6 +438,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("run", cmd_run, "serve the console against a platform")
     sp.add_argument("--port", type=int, default=int(os.environ.get("WEB_PORT", "8000")))
     sp.add_argument("--reload", action="store_true")
+    sp.add_argument("--chaos", action="store_true",
+                    help="show the chaos panel (cut the network mid-run). Local console only")
     sp = add("ask", cmd_ask, "start a ResearchWorkflow from the terminal")
     sp.add_argument("question")
     sp.add_argument("-p", "--provider", default="claude", help="claude or gemini")

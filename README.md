@@ -47,9 +47,12 @@ cp fleet.toml.example fleet.toml          # per-developer config, gitignored, no
 ./fleet tunnel & ./fleet run -w cloudrun  # the console against the self-hosted VM
 ./fleet ask "How do heat pumps work?" -w agentcore -p gemini
 ./fleet status | verify | up | ship | down   # all take -w and --dry-run
+./fleet run -w agentcore --chaos          # adds the Chaos panel: cut the network mid-run, watch retries, restore
 ./fleet warm -w cloudrun                  # cold start is ~2 min; run this before the room arrives
 ./fleet use agentcore                     # make it the default
 ```
+
+**Chaos panel (crash and resume).** `fleet run --chaos` adds a **Chaos** button to the console. **Cut network** makes every model call fail for that run, Temporal retries each part with backoff while the page shows the attempts and a countdown, and **Restore network** lets them finish. It is fault injection (a Signal marks the run and each Activity attempt fails while it is set), local console only: the deployed web tier never enables it.
 
 Ambient `TEMPORAL_*` variables are ignored on purpose, so a shell left on Temporal Cloud cannot redirect a Cloud Run command. `ship` encodes the sharp edges (retained build ids, the digest redeploy, no deploy while Workflows are running); `down` needs `--confirm <platform>`.
 

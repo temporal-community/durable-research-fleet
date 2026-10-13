@@ -14,6 +14,7 @@ import dataclasses
 import inspect
 
 import pytest
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 import llm
@@ -506,3 +507,90 @@ def test_only_research_sub_questions_use_the_research_model():
     assert "model=RESEARCH_MODEL" in inspect.getsource(ra.research_subquestion)
     for fn in (ra.plan_research, ra.synthesize):
         assert "RESEARCH_MODEL" not in inspect.getsource(fn), fn.__name__
+
+
+# --- simulated network outage (the console's chaos panel) -------------------
+
+
+async def test_the_outage_flag_fails_open_when_it_cannot_be_read():
+    """A broken chaos feature must never break real research: no client, no flag."""
+    assert await ra._network_is_cut() is False
+
+
+async def test_a_cut_network_fails_the_attempt_before_any_model_call(monkeypatch, stub_llm):
+    called = []
+
+    async def model(**kw):
+        called.append(kw)
+        return _result("never")
+
+    async def cut():
+        return True
+
+    stub_llm(model)
+    monkeypatch.setattr(ra, "_network_is_cut", cut)
+
+    with pytest.raises(ApplicationError) as err:
+        await ActivityEnvironment().run(ra.research_subquestion, SubQuestion(index=0, text="q"))
+
+    assert err.value.type == "SimulatedNetworkOutage"
+    assert not err.value.non_retryable      # Temporal must retry it: that is the demo
+    assert called == []                     # no tokens spent on a call that cannot go out
+
+
+async def test_cutting_the_network_mid_call_abandons_it_with_a_retryable_error(
+    monkeypatch, stub_llm
+):
+    monkeypatch.setattr(ra, "NETWORK_POLL_SECONDS", 0.05)
+    polls = {"n": 0}
+
+    async def cut_after_a_moment():
+        polls["n"] += 1
+        return polls["n"] > 3                # healthy at the start, then the route drops
+
+    async def long_call(**kw):
+        await asyncio.sleep(30)              # an in-flight request that would take a while
+        return _result("never")
+
+    stub_llm(long_call)
+    monkeypatch.setattr(ra, "_network_is_cut", cut_after_a_moment)
+
+    started = asyncio.get_event_loop().time()
+    with pytest.raises(ApplicationError) as err:
+        await ActivityEnvironment().run(ra.research_subquestion, SubQuestion(index=0, text="q"))
+
+    assert err.value.type == "SimulatedNetworkOutage"
+    assert not err.value.non_retryable
+    assert asyncio.get_event_loop().time() - started < 5, "the in-flight call was not abandoned"
+
+
+async def test_restoring_the_network_lets_the_next_attempt_finish(monkeypatch, stub_llm):
+    async def healthy():
+        return False
+
+    async def ok(**kw):
+        return _result("done")
+
+    stub_llm(ok)
+    monkeypatch.setattr(ra, "_network_is_cut", healthy)
+    finding = await ActivityEnvironment().run(ra.research_subquestion, SubQuestion(index=0, text="q"))
+    assert finding.summary == "done"
+
+
+async def test_the_outage_watcher_can_be_switched_off(monkeypatch, stub_llm):
+    """RESEARCH_NETWORK_POLL_SECONDS=0 means no extra describe calls at all."""
+    monkeypatch.setattr(ra, "NETWORK_POLL_SECONDS", 0)
+    seen = []
+
+    async def spy():
+        seen.append(1)
+        return False
+
+    async def ok(**kw):
+        await asyncio.sleep(0.2)
+        return _result("done")
+
+    stub_llm(ok)
+    monkeypatch.setattr(ra, "_network_is_cut", spy)
+    await ActivityEnvironment().run(ra.research_subquestion, SubQuestion(index=0, text="q"))
+    assert len(seen) == 1                    # only the one check at the start of the attempt

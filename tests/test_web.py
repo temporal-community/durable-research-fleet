@@ -10,6 +10,8 @@ import inspect
 import pathlib
 import time
 
+import pytest
+
 import web
 
 
@@ -271,3 +273,263 @@ def test_fleet_payload_names_the_platform(monkeypatch):
     """`fleet run` exports FLEET_TARGET so the footer can say which platform is live."""
     src = inspect.getsource(web._read_fleet)
     assert '"target"' in src and "FLEET_TARGET" in src and '"namespace"' in src
+
+
+# --------------------------------------------------------------- live activities
+#
+# The page must keep telling the truth while every Worker is gone, which is when a Query
+# cannot answer. These build real PendingActivityInfo protos: no server, no Worker.
+
+from google.protobuf.timestamp_pb2 import Timestamp  # noqa: E402
+from temporalio.api.common.v1 import Payload, Payloads  # noqa: E402
+from temporalio.api.enums.v1 import PendingActivityState  # noqa: E402
+from temporalio.api.failure.v1 import Failure  # noqa: E402
+from temporalio.api.workflow.v1 import PendingActivityInfo  # noqa: E402
+
+NOW = 1_000_000.0
+
+
+def _ts(seconds: float) -> Timestamp:
+    t = Timestamp()
+    t.FromNanoseconds(int(seconds * 1e9))
+    return t
+
+
+def _pa(activity_id="2", attempt=1, state="STARTED", beat_ago=None, started_ago=5.0,
+        next_in=None, failure=None, checkpoint=False, worker="1@localhost-ab"):
+    pa = PendingActivityInfo(
+        activity_id=activity_id,
+        attempt=attempt,
+        state=getattr(PendingActivityState, f"PENDING_ACTIVITY_STATE_{state}"),
+        last_worker_identity=worker,
+    )
+    pa.activity_type.name = "research_subquestion"
+    if started_ago is not None:
+        pa.last_started_time.CopyFrom(_ts(NOW - started_ago))
+    if beat_ago is not None:
+        pa.last_heartbeat_time.CopyFrom(_ts(NOW - beat_ago))
+    if next_in is not None:
+        pa.next_attempt_schedule_time.CopyFrom(_ts(NOW + next_in))
+    if failure:
+        pa.last_failure.CopyFrom(Failure(message=failure))
+    if checkpoint is True:
+        pa.heartbeat_details.CopyFrom(Payloads(payloads=[Payload(
+            data=b'{"phase":"model_call","partial_summary":"found a",'
+                 b'"rounds_done":2,"tokens_so_far":900}')]))
+    elif checkpoint == "liveness":      # what every timer heartbeat sends before any round ends
+        pa.heartbeat_details.CopyFrom(Payloads(payloads=[Payload(
+            data=b'{"phase":"model_call","partial_summary":"","rounds_done":0}')]))
+    return pa
+
+
+def _phase(pa, labels=None):
+    return web.describe_pending_activities([pa], labels or {}, NOW)[0]
+
+
+def test_a_heartbeating_first_attempt_is_running_and_quiet():
+    row = _phase(_pa(beat_ago=3.0))
+    assert row["phase"] == "running" and row["attempt"] == 1 and not row["worker_lost"]
+
+
+def test_no_heartbeat_for_nearly_the_whole_timeout_reads_as_silent():
+    row = _phase(_pa(beat_ago=57.0, started_ago=120.0))
+    assert row["phase"] == "silent" and row["silent_for"] == 57.0
+
+
+def test_a_healthy_activity_with_a_throttled_heartbeat_is_not_called_silent():
+    """REGRESSION, seen live: the SDK sends a heartbeat RPC only about every 48s, so the
+    server-side timestamp of a healthy Activity is routinely 30-45s old. An early threshold
+    marked every healthy part as silent right after the network was restored."""
+    assert _phase(_pa(beat_ago=44.0, started_ago=120.0))["phase"] == "running"
+
+
+def test_a_lost_worker_shows_a_retry_countdown_and_its_checkpoint():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", next_in=12.0,
+                     failure="Activity heartbeat timeout", checkpoint=True))
+    assert row["phase"] == "retry_wait"
+    assert row["retry_in"] == 12.0
+    assert row["worker_lost"] and row["has_checkpoint"]
+
+
+def test_after_the_backoff_it_waits_for_a_worker_not_a_countdown():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", next_in=-3.0))
+    assert row["phase"] == "retrying" and row["retry_in"] is None
+
+
+def test_a_first_attempt_nobody_has_taken_is_queued():
+    assert _phase(_pa(state="SCHEDULED", started_ago=None))["phase"] == "queued"
+
+
+def test_an_ordinary_failure_is_not_called_a_lost_worker():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", next_in=5.0, failure="Error code: 429 rate limited"))
+    assert not row["worker_lost"] and row["last_failure"].startswith("Error code: 429")
+
+
+def test_long_failures_are_clipped_to_one_line():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", failure="x\n" * 400))
+    assert "\n" not in row["last_failure"] and len(row["last_failure"]) <= 160
+
+
+def test_rows_carry_their_sub_question_and_sort_by_it():
+    pas = [_pa(activity_id="4"), _pa(activity_id="3")]
+    labels = {"3": {"index": 0, "text": "first"}, "4": {"index": 1, "text": "second"}}
+    rows = web.describe_pending_activities(pas, labels, NOW)
+    assert [r["index"] for r in rows] == [0, 1] and rows[0]["text"] == "first"
+
+
+async def test_labels_are_read_from_history_once_and_survive_a_bad_payload(monkeypatch):
+    from temporalio.api.history.v1 import HistoryEvent
+
+    def scheduled(activity_id, name):
+        ev = HistoryEvent()
+        a = ev.activity_task_scheduled_event_attributes
+        a.activity_id = activity_id
+        a.activity_type.name = name
+        a.input.payloads.add(data=b"{}")
+        return ev
+
+    class Handle:
+        calls = 0
+
+        async def fetch_history_events(self):
+            Handle.calls += 1
+            for ev in (scheduled("1", "plan_research"), scheduled("2", "research_subquestion"),
+                       scheduled("3", "research_subquestion")):
+                yield ev
+
+    class Converter:
+        async def decode(self, payloads):
+            if len(payloads) and payloads[0].data == b"{}" and Converter.n == 0:
+                Converter.n += 1
+                return [{"index": 0, "text": "why?"}]
+            raise ValueError("undecodable")
+
+        n = 0
+
+    class FakeClient:
+        data_converter = Converter()
+
+    monkeypatch.setattr(web, "_labels", {})
+    got = await web._activity_labels(FakeClient(), Handle(), "wf", {"1", "2", "3"})
+    assert got["2"] == {"index": 0, "text": "why?"}
+    assert got["3"] == {} and got["1"] == {}        # a bad payload costs a label, not the page
+    await web._activity_labels(FakeClient(), Handle(), "wf", {"2"})
+    assert Handle.calls == 1                       # labels are immutable, so history is read once
+
+
+def test_the_page_leaves_attempt_counts_to_temporal_cloud():
+    """Two screens counting attempts on different refresh cadences only disagree, so the page
+    shows no per-part attempt cards or numbers. It keeps the worker-free endpoint for ONE
+    stage line, used while the Query cannot answer."""
+    html = pathlib.Path("web/index.html").read_text()
+    assert "/activities" in html and "noteFrom" in html
+    for gone in ('id="live"', "renderLive", "chaosAttempt", "chaosRetrying", "highest attempt"):
+        assert gone not in html, gone
+
+
+# --------------------------------------------------------------- chaos panel
+
+
+class _JsonRequest:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+class _FakeHandle:
+    def __init__(self):
+        self.signals = []
+
+    async def signal(self, name, *args):
+        self.signals.append((name, args))
+
+
+class _FakeClient:
+    def __init__(self):
+        self.handle = _FakeHandle()
+
+    def get_workflow_handle(self, workflow_id):
+        return self.handle
+
+
+async def _fake_temporal(monkeypatch):
+    client = _FakeClient()
+
+    async def temporal():
+        return client
+
+    monkeypatch.setattr(web, "temporal", temporal)
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "")
+    return client
+
+
+async def test_cut_network_does_not_exist_unless_chaos_is_enabled(monkeypatch):
+    """The deployed web tier must not offer an action that makes runs fail."""
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(web, "CHAOS_ENABLED", False)
+    client = await _fake_temporal(monkeypatch)
+    with pytest.raises(HTTPException) as err:
+        await web.cut_network("wf", _JsonRequest({"cut": True}))
+    assert err.value.status_code == 404 and client.handle.signals == []
+
+
+async def test_cut_network_signals_the_run_when_enabled(monkeypatch):
+    monkeypatch.setattr(web, "CHAOS_ENABLED", True)
+    client = await _fake_temporal(monkeypatch)
+    assert await web.cut_network("wf", _JsonRequest({"cut": True})) == {"ok": True, "cut": True}
+    await web.cut_network("wf", _JsonRequest({"cut": False}))
+    assert client.handle.signals == [("network", (True,)), ("network", (False,))]
+
+
+async def test_cut_network_is_passcode_guarded_and_validates_input(monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(web, "CHAOS_ENABLED", True)
+    client = await _fake_temporal(monkeypatch)
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "letmein")
+    with pytest.raises(HTTPException) as err:
+        await web.cut_network("wf", _JsonRequest({"cut": True, "passcode": "nope"}))
+    assert err.value.status_code == 403
+
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "")
+    for bad in ("yes", 1, None):
+        with pytest.raises(HTTPException) as err:
+            await web.cut_network("wf", _JsonRequest({"cut": bad}))
+        assert err.value.status_code == 400
+    assert client.handle.signals == []
+
+
+def test_an_injected_outage_is_named_as_one_not_as_a_lost_worker():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", next_in=8.0,
+                     failure="Simulated network outage: the model API is unreachable (cut from the console)"))
+    assert row["outage"] and not row["worker_lost"]
+    assert not _phase(_pa(attempt=2, state="SCHEDULED", failure="Activity heartbeat timeout"))["outage"]
+
+
+def test_the_fleet_payload_reports_whether_chaos_is_on():
+    assert '"chaos"' in inspect.getsource(web._read_fleet)
+
+
+def test_the_deployed_web_tier_never_enables_chaos():
+    """Only `fleet run --chaos` sets FLEET_CHAOS. If Terraform or the image ever did, every
+    visitor to the deployed page could make a run fail."""
+    for path in [*pathlib.Path("terraform").glob("*.tf"), pathlib.Path("Dockerfile"),
+                 *pathlib.Path("agentcore").glob("*.tf")]:
+        assert "FLEET_CHAOS" not in path.read_text(), path
+
+
+def test_a_liveness_only_heartbeat_is_not_a_checkpoint():
+    """REGRESSION, seen live: every heartbeat carries details, so "non-empty" showed
+    "resuming from its checkpoint" on parts that had completed no pause_turn round at all."""
+    assert not _phase(_pa(attempt=2, state="SCHEDULED", checkpoint="liveness"))["has_checkpoint"]
+    assert _phase(_pa(attempt=2, state="SCHEDULED", checkpoint=True))["has_checkpoint"]
+
+
+def test_a_retry_is_not_silent_just_because_the_old_attempts_heartbeat_is_stale():
+    """REGRESSION, seen live: a restarted part inherited the previous attempt's heartbeat
+    timestamp, so it read as silent for a minute after the network came back."""
+    row = _phase(_pa(attempt=4, state="STARTED", started_ago=4.0, beat_ago=300.0))
+    assert row["phase"] == "running" and row["silent_for"] == 4.0
