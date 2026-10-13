@@ -10,6 +10,8 @@ import inspect
 import pathlib
 import time
 
+import pytest
+
 import web
 
 
@@ -310,8 +312,13 @@ def _pa(activity_id="2", attempt=1, state="STARTED", beat_ago=None, started_ago=
         pa.next_attempt_schedule_time.CopyFrom(_ts(NOW + next_in))
     if failure:
         pa.last_failure.CopyFrom(Failure(message=failure))
-    if checkpoint:
-        pa.heartbeat_details.CopyFrom(Payloads(payloads=[Payload(data=b'{"text":"partial"}')]))
+    if checkpoint is True:
+        pa.heartbeat_details.CopyFrom(Payloads(payloads=[Payload(
+            data=b'{"phase":"model_call","partial_summary":"found a",'
+                 b'"rounds_done":2,"tokens_so_far":900}')]))
+    elif checkpoint == "liveness":      # what every timer heartbeat sends before any round ends
+        pa.heartbeat_details.CopyFrom(Payloads(payloads=[Payload(
+            data=b'{"phase":"model_call","partial_summary":"","rounds_done":0}')]))
     return pa
 
 
@@ -324,9 +331,16 @@ def test_a_heartbeating_first_attempt_is_running_and_quiet():
     assert row["phase"] == "running" and row["attempt"] == 1 and not row["worker_lost"]
 
 
-def test_no_heartbeat_for_a_while_reads_as_silent_before_temporal_gives_up():
-    row = _phase(_pa(beat_ago=34.0))
-    assert row["phase"] == "silent" and row["silent_for"] == 34.0
+def test_no_heartbeat_for_nearly_the_whole_timeout_reads_as_silent():
+    row = _phase(_pa(beat_ago=57.0, started_ago=120.0))
+    assert row["phase"] == "silent" and row["silent_for"] == 57.0
+
+
+def test_a_healthy_activity_with_a_throttled_heartbeat_is_not_called_silent():
+    """REGRESSION, seen live: the SDK sends a heartbeat RPC only about every 48s, so the
+    server-side timestamp of a healthy Activity is routinely 30-45s old. An early threshold
+    marked every healthy part as silent right after the network was restored."""
+    assert _phase(_pa(beat_ago=44.0, started_ago=120.0))["phase"] == "running"
 
 
 def test_a_lost_worker_shows_a_retry_countdown_and_its_checkpoint():
@@ -408,3 +422,111 @@ def test_the_page_polls_the_worker_free_endpoint():
     row is built with createElement and textContent."""
     html = pathlib.Path("web/index.html").read_text()
     assert "/activities" in html and "renderLive" in html
+
+
+# --------------------------------------------------------------- chaos panel
+
+
+class _JsonRequest:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+class _FakeHandle:
+    def __init__(self):
+        self.signals = []
+
+    async def signal(self, name, *args):
+        self.signals.append((name, args))
+
+
+class _FakeClient:
+    def __init__(self):
+        self.handle = _FakeHandle()
+
+    def get_workflow_handle(self, workflow_id):
+        return self.handle
+
+
+async def _fake_temporal(monkeypatch):
+    client = _FakeClient()
+
+    async def temporal():
+        return client
+
+    monkeypatch.setattr(web, "temporal", temporal)
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "")
+    return client
+
+
+async def test_cut_network_does_not_exist_unless_chaos_is_enabled(monkeypatch):
+    """The deployed web tier must not offer an action that makes runs fail."""
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(web, "CHAOS_ENABLED", False)
+    client = await _fake_temporal(monkeypatch)
+    with pytest.raises(HTTPException) as err:
+        await web.cut_network("wf", _JsonRequest({"cut": True}))
+    assert err.value.status_code == 404 and client.handle.signals == []
+
+
+async def test_cut_network_signals_the_run_when_enabled(monkeypatch):
+    monkeypatch.setattr(web, "CHAOS_ENABLED", True)
+    client = await _fake_temporal(monkeypatch)
+    assert await web.cut_network("wf", _JsonRequest({"cut": True})) == {"ok": True, "cut": True}
+    await web.cut_network("wf", _JsonRequest({"cut": False}))
+    assert client.handle.signals == [("network", (True,)), ("network", (False,))]
+
+
+async def test_cut_network_is_passcode_guarded_and_validates_input(monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(web, "CHAOS_ENABLED", True)
+    client = await _fake_temporal(monkeypatch)
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "letmein")
+    with pytest.raises(HTTPException) as err:
+        await web.cut_network("wf", _JsonRequest({"cut": True, "passcode": "nope"}))
+    assert err.value.status_code == 403
+
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "")
+    for bad in ("yes", 1, None):
+        with pytest.raises(HTTPException) as err:
+            await web.cut_network("wf", _JsonRequest({"cut": bad}))
+        assert err.value.status_code == 400
+    assert client.handle.signals == []
+
+
+def test_an_injected_outage_is_named_as_one_not_as_a_lost_worker():
+    row = _phase(_pa(attempt=2, state="SCHEDULED", next_in=8.0,
+                     failure="Simulated network outage: the model API is unreachable (cut from the console)"))
+    assert row["outage"] and not row["worker_lost"]
+    assert not _phase(_pa(attempt=2, state="SCHEDULED", failure="Activity heartbeat timeout"))["outage"]
+
+
+def test_the_fleet_payload_reports_whether_chaos_is_on():
+    assert '"chaos"' in inspect.getsource(web._read_fleet)
+
+
+def test_the_deployed_web_tier_never_enables_chaos():
+    """Only `fleet run --chaos` sets FLEET_CHAOS. If Terraform or the image ever did, every
+    visitor to the deployed page could make a run fail."""
+    for path in [*pathlib.Path("terraform").glob("*.tf"), pathlib.Path("Dockerfile"),
+                 *pathlib.Path("agentcore").glob("*.tf")]:
+        assert "FLEET_CHAOS" not in path.read_text(), path
+
+
+def test_a_liveness_only_heartbeat_is_not_a_checkpoint():
+    """REGRESSION, seen live: every heartbeat carries details, so "non-empty" showed
+    "resuming from its checkpoint" on parts that had completed no pause_turn round at all."""
+    assert not _phase(_pa(attempt=2, state="SCHEDULED", checkpoint="liveness"))["has_checkpoint"]
+    assert _phase(_pa(attempt=2, state="SCHEDULED", checkpoint=True))["has_checkpoint"]
+
+
+def test_a_retry_is_not_silent_just_because_the_old_attempts_heartbeat_is_stale():
+    """REGRESSION, seen live: a restarted part inherited the previous attempt's heartbeat
+    timestamp, so it read as silent for a minute after the network came back."""
+    row = _phase(_pa(attempt=4, state="STARTED", started_ago=4.0, beat_ago=300.0))
+    assert row["phase"] == "running" and row["silent_for"] == 4.0

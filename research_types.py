@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 
 from llm import Source, Usage
 
+# The Workflow memo key the console's "cut network" Signal writes and Activities read.
+# One definition so the Workflow and the Activity cannot drift apart.
+NETWORK_MEMO_KEY = "network_cut"
+
 
 @dataclass
 class ResearchRequest:

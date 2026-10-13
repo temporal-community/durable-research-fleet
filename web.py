@@ -22,6 +22,7 @@ permission on a page anyone in the room can POST to.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -56,6 +57,10 @@ ASKS_PER_MINUTE_PER_IP = 3
 # CASE-INSENSITIVE on purpose: phone keyboards auto-capitalise the first letter, so a
 # case-sensitive check rejects most of the room on their first try.
 DEMO_PASSCODE = os.environ.get("DEMO_PASSCODE", "").strip()
+# The chaos panel's "cut network" button. OFF unless the process is started with FLEET_CHAOS=1,
+# which only `fleet run --chaos` does. Terraform never sets it, so the deployed web tier has no
+# such endpoint (guarded by test_the_deployed_web_tier_never_enables_chaos).
+CHAOS_ENABLED = os.environ.get("FLEET_CHAOS", "") == "1"
 # Must equal llm.DEFAULT_PROVIDER (web.py cannot import llm); test_web pins the pair.
 DEFAULT_PROVIDER = "anthropic"
 PROVIDERS = frozenset({"gemini", "anthropic"})
@@ -270,10 +275,12 @@ async def run_state(workflow_id: str) -> JSONResponse:
 # service itself, so it works with zero Workers and carries the retry state: attempt,
 # last failure, worker identity, heartbeat age, next retry time.
 #
-# Seconds without a heartbeat before an Activity is shown as silent. The Worker beats every
-# few seconds (research_activities.HEARTBEAT_INTERVAL_SECONDS) and Temporal itself only gives
-# up at the Workflow's heartbeat_timeout, so this is a display threshold, not a policy.
-HEARTBEAT_SILENT_SECONDS = 20.0
+# Seconds without a heartbeat before an Activity is shown as silent. NOT the Worker's beat
+# interval: the SDK throttles heartbeat RPCs to one per ~80% of heartbeat_timeout (48s of the
+# 60s here), so the server-side timestamp of a perfectly healthy Activity is routinely 30-48s
+# old. A 20s threshold flagged every healthy part as silent (seen live). 56s sits just inside
+# the 60s timeout, so "silent" only appears when Temporal is about to give up on it.
+HEARTBEAT_SILENT_SECONDS = 56.0
 ACTIVITIES_TTL_SECONDS = 1.0
 LABELS_MAX_RUNS = 128
 
@@ -294,6 +301,23 @@ def _ts_seconds(ts) -> float | None:
     if ts is None or (ts.seconds == 0 and ts.nanos == 0):
         return None
     return ts.seconds + ts.nanos / 1e9
+
+
+def _has_resumable_checkpoint(details) -> bool:
+    """True only if the last heartbeat carries real progress, not just liveness.
+
+    EVERY heartbeat carries details (the timer beat sends the whole Checkpoint), so
+    "non-empty" says nothing. A Claude Activity has something to resume from only after a
+    pause_turn round completed: `partial_summary` filled and `rounds_done` > 0.
+    """
+    for payload in details.payloads:
+        try:
+            data = json.loads(payload.data)
+        except Exception:
+            continue
+        if isinstance(data, dict) and (data.get("partial_summary") or data.get("rounds_done")):
+            return True
+    return False
 
 
 def describe_pending_activities(pending, labels: dict[str, dict], now: float) -> list[dict]:
@@ -319,7 +343,11 @@ def describe_pending_activities(pending, labels: dict[str, dict], now: float) ->
         failure = _short_failure(pa.last_failure.message) if pa.HasField("last_failure") else None
         # PENDING_ACTIVITY_STATE_STARTED == 2: the only state with a Worker holding it.
         on_worker = int(pa.state) == 2
-        silent_for = max(0.0, now - (beat or started)) if on_worker and (beat or started) else None
+        # A retry inherits the PREVIOUS attempt's heartbeat timestamp, so measure from whichever
+        # is newer: this attempt's start or its latest heartbeat. Using the stale one flagged
+        # every freshly restarted part as silent right after the network was restored.
+        last_sign = max(t for t in (beat, started) if t) if (beat or started) else None
+        silent_for = max(0.0, now - last_sign) if on_worker and last_sign else None
 
         if on_worker:
             phase = "silent" if silent_for is not None and silent_for >= HEARTBEAT_SILENT_SECONDS else "running"
@@ -342,9 +370,12 @@ def describe_pending_activities(pending, labels: dict[str, dict], now: float) ->
                 # An abrupt Worker loss surfaces as a heartbeat timeout on the NEXT attempt's
                 # `last_failure`, which is the clearest "a Worker died" signal Temporal gives.
                 "worker_lost": bool(failure and "heartbeat" in failure.lower()),
+                # The console's own fault injection, so the page can say "network down" and
+                # not "worker lost" for what it caused.
+                "outage": bool(failure and "simulated network outage" in failure.lower()),
                 # Heartbeat details persist across attempts: non-empty means the retry has a
                 # checkpoint to resume from (Claude only; Gemini heartbeats carry liveness).
-                "has_checkpoint": bool(pa.heartbeat_details.payloads),
+                "has_checkpoint": _has_resumable_checkpoint(pa.heartbeat_details),
                 "silent_for": None if silent_for is None else round(silent_for, 1),
                 "retry_in": round(next_at - now, 1) if next_at and next_at > now else None,
             }
@@ -418,6 +449,40 @@ async def run_activities(workflow_id: str) -> JSONResponse:
     if len(_activities_cache) > REVIEW_CACHE_MAX:
         _activities_cache.pop(min(_activities_cache, key=lambda k: _activities_cache[k][0]), None)
     return JSONResponse(payload)
+
+
+@app.post("/api/run/{workflow_id}/network")
+async def cut_network(workflow_id: str, request: Request) -> dict:
+    """Chaos panel: cut or restore the model-API route for ONE run.
+
+    It signals the Workflow, which flags its memo; each Activity attempt then fails while the
+    flag is set and Temporal retries it. Nothing here touches a Worker or a network device.
+
+    Disabled (404, indistinguishable from no such route) unless FLEET_CHAOS=1, and passcode
+    guarded like every other action that changes a run.
+    """
+    if not CHAOS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found.")
+    body = await request.json()
+    if not _passcode_ok(body.get("passcode")):
+        raise HTTPException(status_code=403, detail="Wrong passcode.")
+    cut = body.get("cut")
+    if not isinstance(cut, bool):
+        raise HTTPException(status_code=400, detail="cut must be true or false")
+
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        await handle.signal("network", cut)
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="No such run.") from exc
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+    # The flag changed what the page should show, so drop anything cached about this run.
+    _activities_cache.pop(workflow_id, None)
+    _review_cache.pop(workflow_id, None)
+    logger.info("network %s for %s", "CUT" if cut else "restored", workflow_id)
+    return {"ok": True, "cut": cut}
 
 
 @app.post("/api/run/{workflow_id}/decision")
@@ -558,6 +623,7 @@ async def _read_fleet() -> dict:
         # Set by `fleet run`; empty when the console was started some other way.
         "target": os.environ.get("FLEET_TARGET", ""),
         "namespace": NAMESPACE,
+        "chaos": CHAOS_ENABLED,
     }
 
 

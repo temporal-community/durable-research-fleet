@@ -32,7 +32,14 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from llm import DEFAULT_PROVIDER, PROVIDERS, Usage
     from research_activities import plan_research, research_subquestion, synthesize
-    from research_types import Answer, Finding, ResearchPlan, ResearchRequest, SubQuestion
+    from research_types import (
+        NETWORK_MEMO_KEY,
+        Answer,
+        Finding,
+        ResearchPlan,
+        ResearchRequest,
+        SubQuestion,
+    )
 
 # Invariant: HEARTBEAT_INTERVAL (15s) < HEARTBEAT_TIMEOUT < START_TO_CLOSE.
 # 1200s leaves headroom around one Gemini request with a 300s HTTP ceiling.
@@ -60,7 +67,10 @@ RESEARCH_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
     backoff_coefficient=2.0,
     maximum_interval=timedelta(seconds=60),
-    maximum_attempts=6,
+    # 10, not 6: with a 60s ceiling that is ~5 minutes of retrying (2+4+8+16+32+60x4), enough to
+    # ride out a real provider incident or the console's simulated network outage and then
+    # finish, instead of failing the sub-question inside the first minute.
+    maximum_attempts=10,
     # A refusal is not worth retrying: an identical request gets declined again
     # and burns tokens doing it. Surfaced to the attendee instead.
     non_retryable_error_types=["RefusalError"],
@@ -90,6 +100,9 @@ class _State:
     saved_subquestions: int = 0
     saved_searches: int = 0
     interruptions: int = 0
+    # Simulated network outage for THIS run, set by the `network` Signal. Activities read it
+    # from the Workflow memo (see NETWORK_MEMO_KEY), which Temporal answers without a Worker.
+    network_cut: bool = False
 
 
 @workflow.defn(versioning_behavior=VersioningBehavior.PINNED)
@@ -103,6 +116,11 @@ class ResearchWorkflow:
         self._banked = 0
         self._banked_subquestions = 0
         self._banked_searches = 0
+        # What has already been credited as "not redone". Each unit of finished work is
+        # credited AT MOST ONCE, however many parts are interrupted after it.
+        self._credited = 0
+        self._credited_subquestions = 0
+        self._credited_searches = 0
 
     # ---------------------------------------------------------------- queries
 
@@ -146,6 +164,7 @@ class ResearchWorkflow:
             # WORK, not money. Two attempts at a dollar figure both put a wrong
             # number on a projector. No key here is denominated in currency —
             # guarded by `test_no_money_anywhere_in_the_query`.
+            "network_cut": s.network_cut,
             "durability": {
                 "interruptions": s.interruptions,
                 "saved_subquestions": s.saved_subquestions,
@@ -155,6 +174,18 @@ class ResearchWorkflow:
         }
 
     # --------------------------------------------------------------- signals
+
+    @workflow.signal
+    def network(self, cut: bool) -> None:
+        """Fault injection for the console's chaos panel: cut or restore the model-API route.
+
+        It only flips a flag. Activities poll the flag through the Workflow memo and fail
+        their attempt while it is set, so Temporal's real retry machinery does the rest.
+        Mirrored into the memo because `DescribeWorkflowExecution` returns it with no Worker
+        involved, and an Activity can call that cheaply.
+        """
+        self._s.network_cut = bool(cut)
+        workflow.upsert_memo({NETWORK_MEMO_KEY: bool(cut)})
 
     @workflow.signal
     def review(self, decision: str, note: str = "") -> None:
@@ -309,13 +340,17 @@ class ResearchWorkflow:
         self._s.findings.append(finding)
         self._s.usage = self._s.usage + finding.usage
 
-        if finding.attempt > 1 or finding.resumed:
+        interrupted = finding.attempt > 1 or finding.resumed
+        if interrupted:
             self._s.interruptions += 1
-            self._s.saved_tokens += self._banked
+            # Credit only what was NOT already credited. Without this, an outage that
+            # interrupts every part credits the same finished siblings once per part:
+            # the footer read "15 sub-questions not redone" on a run with 6.
+            self._s.saved_tokens += self._banked - self._credited
             # Counted in the units the stage cares about: how much finished research
             # survived, not what it would have cost to repeat.
-            self._s.saved_subquestions += self._banked_subquestions
-            self._s.saved_searches += self._banked_searches
+            self._s.saved_subquestions += self._banked_subquestions - self._credited_subquestions
+            self._s.saved_searches += self._banked_searches - self._credited_searches
             workflow.logger.info(
                 "sub-question %d survived an interruption (attempt %d, resumed=%s); "
                 "%d sub-questions, %d searches and %d tokens of finished work did "
@@ -323,14 +358,20 @@ class ResearchWorkflow:
                 finding.index,
                 finding.attempt,
                 finding.resumed,
-                self._banked_subquestions,
-                self._banked_searches,
-                self._banked,
+                self._banked_subquestions - self._credited_subquestions,
+                self._banked_searches - self._credited_searches,
+                self._banked - self._credited,
             )
+            self._credited = self._banked
+            self._credited_subquestions = self._banked_subquestions
+            self._credited_searches = self._banked_searches
 
-        self._banked += finding.usage.total_tokens
-        self._banked_subquestions += 1
-        self._banked_searches += finding.usage.web_searches
+        # An interrupted part WAS redone, so it is not work that survived: only clean
+        # findings go into the bank that later interruptions are credited against.
+        if not interrupted:
+            self._banked += finding.usage.total_tokens
+            self._banked_subquestions += 1
+            self._banked_searches += finding.usage.web_searches
 
     async def _draft(self) -> Answer:
         self._s.stage = "drafting"

@@ -21,9 +21,17 @@ import os
 from typing import Any
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 import llm
-from research_types import Answer, Checkpoint, Finding, ResearchPlan, SubQuestion
+from research_types import (
+    NETWORK_MEMO_KEY,
+    Answer,
+    Checkpoint,
+    Finding,
+    ResearchPlan,
+    SubQuestion,
+)
 
 logger = logging.getLogger("research")
 
@@ -137,9 +145,42 @@ SYSTEM_SYNTHESIS = """You are writing the final report answering a research ques
 # --------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------- simulated network outage
+#
+# The console's chaos panel can "cut the network" for one run. It is fault injection, not a
+# real firewall: a Signal sets the Workflow's memo, and the Activity fails its own attempt while
+# the memo says so. Everything after that is Temporal doing what it always does: the attempt
+# fails, the retry policy backs off, the console shows the attempts climbing, and when the
+# network is restored the next attempt succeeds (Claude from its last checkpoint).
+#
+# The flag lives in the memo because DescribeWorkflowExecution is answered by the Temporal
+# service with no Worker involved, so any Worker on any platform can read it with one call.
+NETWORK_POLL_SECONDS = float(os.environ.get("RESEARCH_NETWORK_POLL_SECONDS", "3"))
+NETWORK_OUTAGE = "Simulated network outage: the model API is unreachable (cut from the console)"
+
+
+async def _network_is_cut() -> bool:
+    """Whether this Activity's Workflow is flagged as cut off. Fails OPEN on any error.
+
+    Anything that goes wrong reading the flag (no client, a describe error, a missing memo)
+    reads as "not cut": a broken chaos feature must never break real research.
+    """
+    try:
+        info = activity.info()
+        desc = await activity.client().get_workflow_handle(info.workflow_id).describe()
+        return bool((await desc.memo()).get(NETWORK_MEMO_KEY, False))
+    except Exception:
+        return False
+
+
+async def _raise_if_network_cut() -> None:
+    if await _network_is_cut():
+        raise ApplicationError(NETWORK_OUTAGE, type="SimulatedNetworkOutage")
+
+
 @contextlib.asynccontextmanager
 async def _heartbeating(state: Checkpoint, interval: float | None = None):
-    """Heartbeat `state` on a timer for as long as the block runs.
+    """Heartbeat `state` on a timer for as long as the block runs, and honour a simulated outage.
 
     `state` is mutated by the caller, so each tick carries the freshest progress.
     `asyncio.create_task` copies the current context, which is how the background
@@ -148,21 +189,47 @@ async def _heartbeating(state: Checkpoint, interval: float | None = None):
     The interval is resolved from the module global at CALL time, not captured as a
     default argument — otherwise tests could not shorten it, and an untestable
     heartbeat is how you find out on stage that it never fired.
+
+    A second task watches the outage flag on its own, faster cadence. If the network is cut
+    mid-call it cancels the block's task and the block raises a retryable ApplicationError,
+    so an in-flight model request is abandoned the way a dropped connection would abandon it.
     """
     interval = HEARTBEAT_INTERVAL_SECONDS if interval is None else interval
+    main = asyncio.current_task()
+    cut = False
 
     async def tick() -> None:
         while True:
             await asyncio.sleep(interval)
             activity.heartbeat(state)
 
-    task = asyncio.create_task(tick())
+    async def watch() -> None:
+        nonlocal cut
+        while True:
+            await asyncio.sleep(NETWORK_POLL_SECONDS)
+            if await _network_is_cut():
+                cut = True
+                main.cancel()
+                return
+
+    tasks = [asyncio.create_task(tick())]
+    if NETWORK_POLL_SECONDS > 0:
+        tasks.append(asyncio.create_task(watch()))
     try:
         yield
+    except asyncio.CancelledError:
+        if not cut:
+            raise
+        # We cancelled ourselves. Clear that so the failure below is what Temporal sees,
+        # not a cancellation (which would not be retried).
+        main.uncancel()
+        raise ApplicationError(NETWORK_OUTAGE, type="SimulatedNetworkOutage") from None
     finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 def _resume_from(provider: str) -> Checkpoint | None:
@@ -220,6 +287,7 @@ async def plan_research(
 
     provider = llm.normalize_provider(provider)
     state = Checkpoint(provider=provider)
+    await _raise_if_network_cut()
     async with _heartbeating(state):
         result = await llm.complete(
             provider=provider,
@@ -291,6 +359,7 @@ async def research_subquestion(
         state.tokens_so_far = partial.usage.total_tokens
         activity.heartbeat(state)
 
+    await _raise_if_network_cut()
     try:
         async with _heartbeating(state):
             result = await llm.complete(
@@ -382,6 +451,7 @@ async def synthesize(
 
     provider = llm.normalize_provider(provider)
     state = Checkpoint(provider=provider)
+    await _raise_if_network_cut()
     async with _heartbeating(state):
         result = await llm.complete(
             provider=provider,

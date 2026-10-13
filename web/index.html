@@ -14,9 +14,38 @@
   <img src="/temporal-logo.svg" alt="Temporal" width="76" height="55">
   <span class="what">serverless workers</span>
   <span class="spacer"></span>
+  <button class="plain chaos-btn" id="chaosBtn" hidden aria-controls="chaos" aria-expanded="false">Chaos</button>
   <button class="plain" id="learnBtn">Learn</button>
   <span class="pulse" id="pulse" aria-hidden="true"></span>
 </header>
+
+<!-- Chaos panel. Only reachable when the console was started with `fleet run --chaos`
+     (the server reports `chaos: true`); the deployed web tier never shows it. -->
+<aside class="chaos" id="chaos" hidden aria-labelledby="chaosTitle">
+  <div class="chaos-head">
+    <span class="label" id="chaosTitle">chaos · network</span>
+    <span style="flex:1"></span>
+    <button class="plain" id="chaosClose" aria-label="Close chaos panel">✕</button>
+  </div>
+  <p class="chaos-lede">
+    Cut the route from the workers to the model API. The research calls fail, Temporal
+    retries them with backoff, and the page shows each attempt. Restore it and they finish.
+  </p>
+  <div class="chaos-state" id="chaosState" data-cut="false">
+    <span class="dot" aria-hidden="true"></span>
+    <span id="chaosStateText">network connected</span>
+  </div>
+  <button id="chaosToggle" class="chaos-toggle" disabled>Cut network</button>
+  <p class="chaos-note" id="chaosNote">Ask a question first, then cut the network while it researches.</p>
+  <dl class="chaos-stats">
+    <div><dt>parts retrying</dt><dd id="chaosRetrying">0</dd></div>
+    <div><dt>highest attempt</dt><dd id="chaosAttempt">1</dd></div>
+  </dl>
+  <p class="chaos-fine">
+    This is fault injection: a Signal marks the run, and each Activity attempt fails while
+    it is set. Retries, backoff and recovery are Temporal's own. Nothing real is broken.
+  </p>
+</aside>
 
 <main>
   <!-- ONE DOM. Nothing is removed, only hidden by [data-state], which is what lets
@@ -574,6 +603,73 @@ function runFailed(message) {
   $('runErr').textContent = message;
 }
 
+/* ------------------------------------------------------------ chaos panel */
+
+let chaosOn = false, netCut = false, chaosBusy = false;
+
+function renderChaos() {
+  const st = $('chaosState');
+  st.dataset.cut = String(netCut);
+  $('chaosStateText').textContent = netCut ? 'network cut: the model API is unreachable' : 'network connected';
+  const t = $('chaosToggle');
+  t.textContent = netCut ? 'Restore network' : 'Cut network';
+  t.classList.toggle('restore', netCut);
+  t.disabled = chaosBusy || !runId;
+  $('chaosNote').textContent = !runId
+    ? 'Ask a question first, then cut the network while it researches.'
+    : netCut ? 'Watch the parts on the page: attempts climb as Temporal retries. Restore when you are ready.'
+             : 'Cut it while the parts are researching to see them fail and retry.';
+  $('chaosBtn').classList.toggle('cut', netCut);
+}
+
+function renderChaosStats(acts) {
+  const retrying = acts.filter((a) => a.attempt > 1).length;
+  $('chaosRetrying').textContent = String(retrying);
+  $('chaosAttempt').textContent = String(acts.reduce((m, a) => Math.max(m, a.attempt), 1));
+}
+
+function showChaos(enabled) {
+  if (enabled === chaosOn) return;
+  chaosOn = enabled;
+  $('chaosBtn').hidden = !enabled;
+  if (!enabled) $('chaos').hidden = true;
+}
+
+function toggleChaosPanel() {
+  const panel = $('chaos');
+  panel.hidden = !panel.hidden;
+  $('chaosBtn').setAttribute('aria-expanded', String(!panel.hidden));
+  renderChaos();
+}
+
+async function toggleNetwork() {
+  if (!runId || chaosBusy) return;
+  chaosBusy = true; renderChaos();
+  try {
+    const res = await fetch('/api/run/' + runId + '/network', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cut: !netCut, passcode: passcode() }),
+    });
+    if (res.ok) {
+      netCut = !netCut;
+      $('chaosNote').textContent = '';
+    } else {
+      const body = await res.json().catch(() => ({}));
+      $('chaosNote').textContent = body.detail || 'Could not change the network.';
+    }
+  } catch { $('chaosNote').textContent = 'Could not reach the console.'; }
+  chaosBusy = false;
+  const keep = $('chaosNote').textContent;
+  renderChaos();
+  if (keep) $('chaosNote').textContent = keep;
+  pollActivities();
+}
+
+$('chaosBtn').addEventListener('click', toggleChaosPanel);
+$('chaosClose').addEventListener('click', toggleChaosPanel);
+$('chaosToggle').addEventListener('click', toggleNetwork);
+
 /* ------------------------------------------------- what Temporal says is in flight */
 
 // `/api/run/{id}` is a Query, which needs a live Worker. `/api/run/{id}/activities` is answered
@@ -581,30 +677,37 @@ function runFailed(message) {
 // moment worth showing: a Worker died mid-Activity and nothing has been lost.
 let liveNote = '';
 
+function causeOf(a) {
+  if (a.outage) return 'network down, ';
+  return a.worker_lost ? 'worker lost, ' : '';
+}
+
 function liveSentence(a) {
   const bits = [];
   if (a.phase === 'silent') {
-    bits.push('no heartbeat for ' + Math.round(a.silent_for) + 's, the worker may be lost');
+    bits.push('no heartbeat for ' + Math.round(a.silent_for) + 's, the worker may be lost (Temporal gives up at 60s)');
   } else if (a.phase === 'retry_wait') {
-    bits.push((a.worker_lost ? 'worker lost, ' : '') + 'retrying in ' + Math.ceil(a.retry_in) + 's');
+    bits.push(causeOf(a) + 'retrying in ' + Math.ceil(a.retry_in) + 's');
   } else if (a.phase === 'retrying') {
-    bits.push((a.worker_lost ? 'worker lost, ' : '') + 'waiting for a worker to take it');
+    bits.push(causeOf(a) + 'waiting for a worker to take it');
   } else if (a.attempt > 1) {
-    bits.push('running again on a new worker');
+    bits.push('running again');
   }
   if (a.attempt > 1 && a.has_checkpoint) bits.push('resuming from its checkpoint');
   return bits.join(' · ');
 }
 
 function renderLive(acts) {
+  renderChaosStats(acts);
   // Only the notable ones. A healthy first attempt is the happy path and would be noise.
   const notable = acts.filter((a) => a.attempt > 1 || a.phase === 'silent');
   const ul = $('live');
   ul.hidden = notable.length === 0;
   liveNote = '';
   if (!notable.length) { ul.replaceChildren(); return; }
-  liveNote = notable.some((a) => a.phase === 'silent' || a.worker_lost)
-    ? 'recovering from a lost worker' : 'retrying';
+  liveNote = notable.some((a) => a.outage) ? 'network down, retrying'
+    : notable.some((a) => a.phase === 'silent' || a.worker_lost) ? 'recovering from a lost worker'
+    : 'retrying';
   const frag = document.createDocumentFragment();
   notable.forEach((a) => {
     const li = el('li', 'live-' + a.phase);
@@ -653,6 +756,11 @@ async function pollRun() {
     s = await res.json();
   } catch { return; }      // network blip: the next tick retries
   $('runErr').textContent = '';
+
+  if (typeof s.network_cut === 'boolean' && s.network_cut !== netCut && !chaosBusy) {
+    netCut = s.network_cut;   // the run is the source of truth, not this tab's last click
+    renderChaos();
+  }
 
   if (s.question && !$('qtitle').textContent) {
     $('qtitle').textContent = s.question;
@@ -778,6 +886,7 @@ async function pollFleet() {
   let f;
   try { f = await (await fetch('/api/fleet')).json(); } catch { return; }
 
+  showChaos(!!f.chaos);
   setNum($('tWorkers'), f.workers);
   setNum($('tSpawned'), f.started);
   $('tWorkers').classList.toggle('zero', f.workers === 0);
