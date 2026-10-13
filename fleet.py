@@ -258,6 +258,40 @@ def refuse_if_parked(ctx: Ctx, force: bool) -> None:
         )
 
 
+def cmd_warm(ctx: Ctx, args) -> int:
+    """Have workers up BEFORE the first question. The cold start is platform provisioning.
+
+    Measured 2026-10-13 on Cloud Run: ~125s from the controller's scale request to the first
+    Worker polling, on a warm AND a brand-new revision alike, of which the container itself
+    is ~6s. Nothing in this repo shortens that, but the controller scales in only ~1 instance
+    a minute, so instances raised now are still there when the room starts asking.
+    """
+    banner(ctx)
+    name = ctx.target.name
+    if name == "local":
+        ctx.say("local has no cold start.")
+        return 0
+    if name == "agentcore":
+        # Any Workflow makes Temporal Cloud invoke a session; the hello app needs no model key.
+        rc, _ = ctx.run(["temporal", "workflow", "start", "--type", "HelloWorkflow",
+                         "--task-queue", ctx.target.task_queue,
+                         "--workflow-id", f"warm-{uuid.uuid4().hex[:8]}", "--input", '"warm"'])
+        if rc == 0 and not ctx.dry_run:
+            ctx.say("a session starts in ~20s and stays up for the debounce window.")
+        return rc
+    sec = ctx.config.get("cloudrun", {})
+    project, region = sec.get("project"), sec.get("region", "us-central1")
+    if not project:
+        raise FleetError("set [cloudrun] project in fleet.toml")
+    pool = f"{sec.get('prefix', 'research-fleet')}-worker-pool"
+    rc, _ = ctx.run(["gcloud", "run", "worker-pools", "update", pool, "--instances", str(args.count),
+                     "--region", region, "--project", project])
+    if rc == 0 and not ctx.dry_run:
+        ctx.say(f"asked for {args.count} instances. Allow ~2-3 minutes before the first question; "
+                "the controller then scales in about one instance a minute.")
+    return rc
+
+
 def cmd_up(ctx: Ctx, args) -> int:
     banner(ctx)
     auto = ["AUTO=1"] if args.yes else []
@@ -406,6 +440,8 @@ def build_parser() -> argparse.ArgumentParser:
     add("status", cmd_status, "deployment, running Workflows, platform notes")
     sp = add("verify", cmd_verify, "smoke test (no model tokens)")
     sp.add_argument("--scale", action="store_true", help="cloudrun: full scale-from-zero cycle")
+    sp = add("warm", cmd_warm, "have workers up before the first question (cold start is ~2 min)")
+    sp.add_argument("--count", type=int, default=6, help="cloudrun: instances to raise (default: the fan-out width)")
     sp = add("up", cmd_up, "deploy the stack")
     sp.add_argument("-y", "--yes", action="store_true", help="skip Terraform's approval prompt")
     sp = add("ship", cmd_ship, "deploy a new Build ID the careful way")

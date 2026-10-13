@@ -47,6 +47,7 @@ cp fleet.toml.example fleet.toml          # per-developer config, gitignored, no
 ./fleet tunnel & ./fleet run -w cloudrun  # the console against the self-hosted VM
 ./fleet ask "How do heat pumps work?" -w agentcore -p gemini
 ./fleet status | verify | up | ship | down   # all take -w and --dry-run
+./fleet warm -w cloudrun                  # cold start is ~2 min; run this before the room arrives
 ./fleet use agentcore                     # make it the default
 ```
 

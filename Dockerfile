@@ -28,6 +28,11 @@ COPY web/ ./web/
 # Without this line the Learn modal 404s on Cloud Run while working perfectly locally.
 COPY learn/README.md ./learn/README.md
 
+# Compile the app modules now. PYTHONDONTWRITEBYTECODE plus a non-root user means nothing
+# could write .pyc at runtime, so every cold instance recompiled them. Worth under a second:
+# the dominant cold-start cost is Cloud Run provisioning the instance (AGENTS.md, "Cold start").
+RUN python -m compileall -q /app
+
 # Run as non-root. Nothing here needs write access to the filesystem.
 RUN useradd --create-home --uid 10001 worker
 USER worker

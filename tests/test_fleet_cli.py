@@ -155,3 +155,17 @@ def test_missing_agentcore_key_is_a_clear_error(root):
     (root / ".env").unlink()
     rc, rec, _ = go(root, ["ask", "q", "-w", "agentcore"])
     assert rc == 2 and not rec.calls
+
+
+def test_warm_cloudrun_raises_the_pool_to_the_fanout_width(root):
+    rc, rec, _ = go(root, ["warm", "-w", "cloudrun"])
+    assert rc == 0
+    assert rec.argvs == [
+        "gcloud run worker-pools update rf-worker-pool --instances 6 --region us-central1 --project p1"
+    ]
+
+
+def test_warm_agentcore_starts_a_hello_workflow_not_a_research_one(root):
+    _, rec, _ = go(root, ["warm", "-w", "agentcore"])
+    argv = rec.argvs[0]
+    assert "--type HelloWorkflow" in argv and "ResearchWorkflow" not in argv  # spends no model tokens
