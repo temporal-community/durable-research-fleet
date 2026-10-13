@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 #   workflows/activities.py     the hello app — the infrastructure smoke test
 #   llm, research_*             the research app
 #   web.py + web/               the request-serving tier
-COPY runtime.py workflows.py activities.py worker_cloudrun.py ./
+COPY runtime.py apps.py workflows.py activities.py worker_cloudrun.py ./
 COPY llm.py research_types.py research_activities.py research_workflow.py ./
 COPY web.py ./
 COPY web/ ./web/

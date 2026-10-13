@@ -127,6 +127,19 @@ Infra identifiers are `research-fleet` (prefix, deployment name) and
 stack** — the names are baked into every resource — so don't do it casually; the
 2026-07-29 pass cost a full teardown, a fresh VM bootstrap and a new demo URL.
 
+> **AgentCore target added 2026-10-05** (branch `feat/agentcore-serverless-worker`):
+> the same two apps can run as Temporal Serverless Workers on Amazon Bedrock AgentCore
+> Runtime against ONE Temporal Cloud Namespace. Read `docs/AGENTCORE.md`. It is
+> offline-tested (152 Python tests plus `make test-ac`) and **verified live on 2026-10-05**:
+> the hello smoke test, and the research app with both Claude and Gemini. `docs/AGENTCORE.md`
+> lists exactly what is and isn't proven. Worker counts differ from Cloud Run: Temporal
+> chose 2-4 sessions for 5-6 queued tasks, not one per task.
+> The README's "Choose your platform" table is the user-facing summary of Cloud Run vs
+> AgentCore; keep it in step with this file and `docs/AGENTCORE.md` when either changes.
+> Rules: `agentcore_runtime.py` must not import `bedrock_agentcore` (only
+> `worker_agentcore.py` does); `requirements.txt` must stay free of AgentCore deps so the
+> Cloud Run image is unchanged; an endpoint must never follow a new Runtime version.
+
 ## Verification status
 
 The Temporal/Cloud Run infrastructure observations below come from 2026-07/08
@@ -216,7 +229,8 @@ Don't reintroduce:
 
 A high-effort review on 2026-07-28 found 10 more, all fixed. The ones most worth
 not regressing:
-5. **`MAX_CONCURRENT_ACTIVITIES` must stay at 1.** The SDK default is 100, which
+5. **`MAX_CONCURRENT_ACTIVITIES` must stay at 1 on Cloud Run** (AgentCore is deliberately 3; see
+   `docs/AGENTCORE.md`). The SDK default is 100, which
    lets one instance absorb a whole burst so no Task Queue backlog forms and the
    WCI never scales — the demo silently does nothing. Verified: `--count 5` takes
    ~25s with the limit vs ~5s without. Also KB §4 slot isolation.
@@ -420,7 +434,10 @@ Research app (full reasoning in `decisions/05-research-agent.md`):
 - **Both search tools are server-side.** Gemini uses Google Search grounding and
   Claude uses Anthropic web search. Do not add a local scraper or client-side tool
   loop unless the architecture is deliberately being changed.
-- **Provider choice is request-scoped Workflow input.** The UI defaults to Gemini.
+- **Provider choice is request-scoped Workflow input.** On the AgentCore branch the UI and
+  `llm.DEFAULT_PROVIDER` default to Claude (2026-10-05); `main` still defaults to Gemini, so
+  merging flips the GCP demo's default. Changing the default is a code change to Workflow
+  code, so ship it under a new Build ID.
   Do not replace it with `RESEARCH_PROVIDER`; ambient configuration could switch a
   retry or replay to a different model than the one recorded when the run started.
 - **No time-skipping is possible in tests.** The test server rejects Worker

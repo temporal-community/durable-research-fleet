@@ -56,7 +56,8 @@ ASKS_PER_MINUTE_PER_IP = 3
 # CASE-INSENSITIVE on purpose: phone keyboards auto-capitalise the first letter, so a
 # case-sensitive check rejects most of the room on their first try.
 DEMO_PASSCODE = os.environ.get("DEMO_PASSCODE", "").strip()
-DEFAULT_PROVIDER = "gemini"
+# Must equal llm.DEFAULT_PROVIDER (web.py cannot import llm); test_web pins the pair.
+DEFAULT_PROVIDER = "anthropic"
 PROVIDERS = frozenset({"gemini", "anthropic"})
 
 
@@ -90,6 +91,39 @@ _fleet_cache: dict | None = None
 _fleet_cached_at = 0.0
 _fleet_lock = asyncio.Lock()
 FLEET_TTL_SECONDS = 1.0
+
+
+# Last good `progress` state of runs PARKED at human review. A parked run changes only when
+# a Signal arrives, and the only Signal source here is /decision (or the 2h review
+# timeout), so its state can be served without a Query. That matters on AgentCore: a Query
+# needs a live Worker, sessions drain after ~60s idle, and every page view after that
+# cold-started one (measured 5.7s, versus 0.3s warm). Bounded so a long-lived process
+# cannot grow without limit. Only `awaiting_review` states are cached: a running run's
+# numbers move, and serving them stale would show a frozen progress bar.
+REVIEW_CACHE_TTL_SECONDS = 120.0
+REVIEW_CACHE_MAX = 256
+_review_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _review_cache_get(workflow_id: str) -> dict | None:
+    hit = _review_cache.get(workflow_id)
+    if hit is None:
+        return None
+    stored_at, state = hit
+    if time.monotonic() - stored_at > REVIEW_CACHE_TTL_SECONDS:
+        _review_cache.pop(workflow_id, None)
+        return None
+    return state
+
+
+def _review_cache_put(workflow_id: str, state: dict) -> None:
+    if not state.get("awaiting_review"):
+        _review_cache.pop(workflow_id, None)
+        return
+    if len(_review_cache) >= REVIEW_CACHE_MAX and workflow_id not in _review_cache:
+        oldest = min(_review_cache, key=lambda k: _review_cache[k][0])
+        _review_cache.pop(oldest, None)
+    _review_cache[workflow_id] = (time.monotonic(), state)
 
 
 async def temporal() -> Client:
@@ -209,6 +243,9 @@ async def run_state(workflow_id: str) -> JSONResponse:
     polling. Mapping every exception to 404 made the page declare healthy runs dead
     ~30s in — right in the scale-from-zero window the demo is about.
     """
+    cached = _review_cache_get(workflow_id)
+    if cached is not None:
+        return JSONResponse(cached)
     client = await temporal()
     handle = client.get_workflow_handle(workflow_id)
     try:
@@ -221,6 +258,7 @@ async def run_state(workflow_id: str) -> JSONResponse:
     except Exception as exc:
         logger.info("query %s failed: %s", workflow_id, exc)
         raise HTTPException(status_code=503, detail="Waiting for a worker.") from exc
+    _review_cache_put(workflow_id, state)
     return JSONResponse(state)
 
 
@@ -252,6 +290,9 @@ async def decide(workflow_id: str, request: Request) -> dict:
     note = (body.get("note") or "").strip()[:MAX_QUESTION_CHARS]
     client = await temporal()
     handle = client.get_workflow_handle(workflow_id)
+    # The Signal changes the run's state, so a cached "awaiting_review" is now wrong. Drop
+    # it BEFORE signalling: the other order lets a poll in between re-cache the old state.
+    _review_cache.pop(workflow_id, None)
     await handle.signal("review", args=[decision, note])
     logger.info("signalled %s: %s", workflow_id, decision)
     return {"ok": True}

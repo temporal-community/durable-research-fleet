@@ -31,6 +31,9 @@ BUILD_ID ?= v1
 # Kept as its own variable rather than derived from PREFIX: the infra identifiers say
 # research-fleet/research-queue and renaming them forces resource recreation for no gain.
 TASK_QUEUE ?= research-queue
+# Bump if a redeploy dies on "role_id (workerPoolScaler) ... marked for deletion":
+# GCP reserves a deleted custom role's id for 37 days (terraform/variables.tf).
+SCALER_ROLE_SUFFIX ?=
 GEMINI_MODEL ?= gemini-3.6-flash
 ANTHROPIC_MODEL ?= claude-opus-5
 
@@ -46,6 +49,10 @@ AUTO_SCALED_WORKERS_VERSION ?= v0.0.0-20260811170210-91f6fe1d10ab
 #   make tunnel LOCAL_FRONTEND_PORT=7433
 LOCAL_FRONTEND_PORT ?= 7233
 LOCAL_UI_PORT       ?= 8233
+# The console's own port. 8000 is a popular default (uvicorn, http.server, plenty of
+# dev servers), so this is overridable for the same reason the tunnel ports are:
+#   make web-local WEB_PORT=8100
+WEB_PORT            ?= 8000
 
 IMAGE := $(REGION)-docker.pkg.dev/$(PROJECT)/$(PREFIX)-repo/research-worker:$(BUILD_ID)
 TF    := terraform -chdir=terraform
@@ -69,7 +76,8 @@ TF_VARS := \
   -var="task_queue=$(TASK_QUEUE)" \
   -var="build_id=$(BUILD_ID)" \
   -var="gemini_model=$(GEMINI_MODEL)" \
-  -var="anthropic_model=$(ANTHROPIC_MODEL)"
+  -var="anthropic_model=$(ANTHROPIC_MODEL)" \
+  -var="scaler_role_suffix=$(SCALER_ROLE_SUFFIX)"
 
 # Fail fast rather than half-deploying on a mismatch.
 #
@@ -86,7 +94,7 @@ check-config:
 	  echo "         make $(MAKECMDGOALS) PROJECT=your-project-id"; \
 	  exit 1; }
 
-.PHONY: help up down image cli plan apply destroy repo bootstrap-log ui tunnel status fmt check-config adopt register-queues test test-py test-tf verify web-local
+.PHONY: ac-build ac-init ac-plan ac-apply ac-secrets ac-register ac-verify ac-down ac-prune web-cloud test-ac help up down image cli plan apply destroy repo bootstrap-log ui tunnel status fmt check-config adopt register-queues test test-py test-tf verify web-local
 
 help:
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | expand -t22
@@ -247,20 +255,25 @@ register-queues: ## One-time after first apply: let the pool poll once so Task Q
 #   - raise the slot count LOCALLY only. The deployed default of 1 is what makes one
 #     question light up six Serverless Workers; locally there is no Worker Controller
 #     to scale, so slot=1 just serialises six multi-minute Activities for no gain.
-web-local: ## Serve the research console against a local dev server
-	@echo "==> http://localhost:8000   (phone and projector — one page)"
-	TEMPORAL_ADDRESS=$${TEMPORAL_ADDRESS:-localhost:7233} \
-	  .venv/bin/python -m uvicorn web:app --reload --port 8000 --no-proxy-headers
+web-local: ## Serve the research console (WEB_PORT, against LOCAL_FRONTEND_PORT)
+	$(call check_port,$(WEB_PORT),web-local,WEB_PORT)
+	@echo "==> http://localhost:$(WEB_PORT)   (phone and projector — one page)"
+	@echo "    talking to Temporal at localhost:$(LOCAL_FRONTEND_PORT)"
+	TEMPORAL_ADDRESS=$${TEMPORAL_ADDRESS:-localhost:$(LOCAL_FRONTEND_PORT)} \
+	  .venv/bin/python -m uvicorn web:app --reload --port $(WEB_PORT) --no-proxy-headers
 
 ## --- tests ---------------------------------------------------------------
 
-test: test-py test-tf ## Run every offline test (no cloud resources touched)
+test: test-py test-tf test-ac ## Run every offline test (no cloud resources touched)
 
 test-py: ## pytest: workflow, activity, replay and Serverless-contract tests
 	.venv/bin/python -m pytest
 
 test-tf: ## terraform test: plan-only assertions on the stack wiring
 	$(TF) test
+
+test-ac: ## terraform test for the AgentCore stack (mocked provider; no AWS calls)
+	cd agentcore && terraform init -backend=false -input=false >/dev/null && terraform test
 
 verify: ## Verify the LIVE stack (add SCALE=1 for the full scale-from-zero cycle)
 	@PROJECT=$(PROJECT) REGION=$(REGION) ZONE=$(ZONE) PREFIX=$(PREFIX) \
@@ -278,22 +291,94 @@ bootstrap-log: ## Tail the VM bootstrap log
 
 # Fail with a useful message instead of ssh's bare "Address already in use".
 define check_port
-	@lsof -i :$(1) >/dev/null 2>&1 && { \
+	@lsof -nP -iTCP:$(1) -sTCP:LISTEN >/dev/null 2>&1 && { \
 	  echo "ERROR: local port $(1) is already in use."; \
 	  echo "       Pick another:  make $(2) $(3)=<port>"; \
 	  exit 1; } || true
 endef
 
+# A bare `gcloud compute ssh -L` tunnel is a single TCP connection with no
+# keepalive, and it dies for reasons that have nothing to do with the demo:
+# a VPN re-handshake, a laptop sleeping, a network switch. When it dies the
+# console keeps serving pages while every Temporal call fails, which reads on
+# stage as "the app is broken" rather than "the tunnel dropped".
+#
+# So: ServerAliveInterval notices a dead peer in ~45s instead of hanging, and
+# the while-loop re-dials. ExitOnForwardFailure matters more than it looks --
+# without it ssh happily connects while silently failing to bind the local
+# port, so you get a live session forwarding nothing.
+#
+# The trade-off is that Ctrl-C now has to break the loop, not just ssh, hence
+# the explicit trap.
+define ssh_tunnel
+	@echo "==> $(3) on localhost:$(1) — leave this running (auto-reconnects)"
+	@trap 'echo; echo "==> tunnel closed"; exit 0' INT; \
+	while true; do \
+	  gcloud compute ssh $(PREFIX)-temporal --zone $(ZONE) --project $(PROJECT) -- -N \
+	    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+	    -L $(1):localhost:$(2) || true; \
+	  echo "    [$$(date +%H:%M:%S)] tunnel on $(1) dropped — reconnecting in 5s"; \
+	  sleep 5; \
+	done
+endef
+
 tunnel: ## Forward the frontend to localhost:$(LOCAL_FRONTEND_PORT) (starter.py then works unchanged)
 	$(call check_port,$(LOCAL_FRONTEND_PORT),tunnel,LOCAL_FRONTEND_PORT)
-	@echo "==> frontend on localhost:$(LOCAL_FRONTEND_PORT) — leave this running"
 	@echo "    TEMPORAL_ADDRESS=localhost:$(LOCAL_FRONTEND_PORT) .venv/bin/python starter.py --watch"
-	gcloud compute ssh $(PREFIX)-temporal --zone $(ZONE) --project $(PROJECT) -- -N -L $(LOCAL_FRONTEND_PORT):localhost:7233
+	$(call ssh_tunnel,$(LOCAL_FRONTEND_PORT),7233,frontend)
 
 ui: ## Forward the Temporal Web UI to http://localhost:$(LOCAL_UI_PORT)
 	$(call check_port,$(LOCAL_UI_PORT),ui,LOCAL_UI_PORT)
-	@echo "==> Temporal UI at http://localhost:$(LOCAL_UI_PORT) — leave this running"
-	gcloud compute ssh $(PREFIX)-temporal --zone $(ZONE) --project $(PROJECT) -- -N -L $(LOCAL_UI_PORT):localhost:8233
+	$(call ssh_tunnel,$(LOCAL_UI_PORT),8233,Temporal UI)
 
 fmt:
 	$(TF) fmt
+
+## --- AgentCore on Temporal Cloud (see docs/AGENTCORE.md) -------------------------------
+#
+# A second deployment target, beside the GCP/Cloud Run stack above. The Worker runs in an
+# Amazon Bedrock AgentCore Runtime session and Temporal Cloud invokes it. Order:
+#   make ac-build ac-apply ac-secrets ac-register ac-verify
+# Everything reads agentcore/terraform.tfvars (gitignored) for the Namespace.
+AC := terraform -chdir=agentcore
+
+ac-build: ## Build the arm64 Runtime zip (deterministic, so no spurious versions)
+	./agentcore/build.sh
+
+ac-init:
+	$(AC) init -input=false
+
+ac-plan: ac-init ac-build ## Show the AWS plan
+	./agentcore/guard.sh
+	$(AC) plan -input=false
+
+ac-apply: ac-init ac-build ## Apply the AWS stack (AUTO=1 skips the approval prompt)
+	./agentcore/guard.sh
+	$(AC) apply $(if $(AUTO),-auto-approve,)
+
+ac-secrets: ## Seed Secrets Manager from .env (never overwrites; FORCE=1 to replace)
+	./agentcore/seed-secrets.sh
+
+ac-register: ## Register this build's endpoint with Temporal Cloud (SET_CURRENT=1 to route to it)
+	./agentcore/register.sh
+
+ac-verify: ## Run a real Workflow end to end on AgentCore and check the fleet
+	./agentcore/verify.sh
+
+ac-prune: ## READ-ONLY: show each Version's drainage; only drained ones may leave retained_build_ids
+	@test -f .env || { echo ".env is required (TEMPORAL_API_KEY)"; exit 1; }
+	@set -a; . ./.env; set +a; \
+	  NS=$$($(AC) output -raw temporal_namespace); \
+	  TEMPORAL_ADDRESS=$$NS.tmprl.cloud:7233 TEMPORAL_NAMESPACE=$$NS \
+	  temporal worker deployment describe --name $$($(AC) output -raw deployment_name)
+
+ac-down: ## Destroy the AWS stack (the Temporal Deployment/Version is left; unset it yourself)
+	$(AC) destroy $(if $(AUTO),-auto-approve,)
+
+web-cloud: ## Serve the console against the Temporal Cloud Namespace in .env
+	$(call check_port,$(WEB_PORT),web-cloud,WEB_PORT)
+	@set -a; . ./.env; set +a; \
+	  TEMPORAL_ADDRESS=$$($(AC) output -raw temporal_namespace).tmprl.cloud:7233 \
+	  TEMPORAL_NAMESPACE=$$($(AC) output -raw temporal_namespace) \
+	  TEMPORAL_TASK_QUEUE=$(TASK_QUEUE) \
+	  .venv/bin/python -m uvicorn web:app --port $(WEB_PORT) --no-proxy-headers

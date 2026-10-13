@@ -27,3 +27,7 @@ bin/
 # doesn't work. Deliberately not committed — it's session narrative and judgement
 # calls, not project documentation. AGENTS.md points at it for future sessions.
 decisions/
+
+# AgentCore stack: same rules as terraform/ (state holds role ARNs and the external id).
+agentcore/.terraform/
+agentcore/build/

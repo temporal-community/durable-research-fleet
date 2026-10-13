@@ -25,21 +25,33 @@ logger = logging.getLogger("llm")
 
 # Provider selection is request-scoped and recorded in Workflow history. Do not
 # turn this into an environment switch: one deployment intentionally serves both.
-DEFAULT_PROVIDER = "gemini"
+DEFAULT_PROVIDER = "anthropic"
 PROVIDERS = frozenset({"gemini", "anthropic"})
 
 # Model overrides remain deployment settings; the PROVIDER does not.
+#
+# Always name the provider. There is deliberately no bare `MODEL` alias: before the
+# dual-provider port this module exported `MODEL = "claude-opus-5"`, so a name kept
+# "for compatibility" would resolve to a Gemini id for every caller that previously
+# got a Claude one — the same symbol quietly changing provider is worse than an
+# ImportError, which at least points at the line to fix. `test_no_ambiguous_model_alias`
+# keeps it gone.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip()
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5").strip()
-# Backwards-compatible name used by existing Gemini-focused tests and callers.
-MODEL = GEMINI_MODEL
 
 # Gemini performs the search, retrieval and grounding on Google's servers. There
 # is no local tool loop and no separate search API key.
 WEB_SEARCH_TOOL = types.Tool(google_search=types.GoogleSearch())
-ANTHROPIC_WEB_SEARCH_TOOL: dict[str, str] = {
+# Search budget per Claude request. Measured 2026-10-05: with no cap a six-way research
+# fan-out ran 66 searches (~11 each) and took 4m36s, because every search can force
+# another server-side round that re-sends the whole context. A cap is the largest single
+# latency and token lever. Over the cap the tool returns an error result and Claude
+# answers with what it has. 0 removes the cap.
+ANTHROPIC_MAX_SEARCHES = max(0, int(os.environ.get("CLAUDE_MAX_SEARCHES", "4")))
+ANTHROPIC_WEB_SEARCH_TOOL: dict[str, Any] = {
     "type": "web_search_20260209",
     "name": "web_search",
+    **({"max_uses": ANTHROPIC_MAX_SEARCHES} if ANTHROPIC_MAX_SEARCHES else {}),
 }
 
 # One grounded request can legitimately take minutes. This is a per-request
@@ -350,8 +362,14 @@ async def _complete_anthropic(
     json_schema: dict[str, Any] | None = None,
     cache_system: bool = False,
     on_progress: Callable[[LLMResult], None] | None = None,
+    model: str | None = None,
 ) -> LLMResult:
-    """Run one logical Claude turn, continuing across pause_turn boundaries."""
+    """Run one logical Claude turn, continuing across pause_turn boundaries.
+
+    `model` overrides ANTHROPIC_MODEL for this call only. The research fan-out uses it to
+    run the narrow, search-bound sub-questions on a faster model while planning and the
+    final synthesis stay on the main one.
+    """
     output_config: dict[str, Any] = {"effort": effort}
     if json_schema is not None:
         output_config["format"] = {"type": "json_schema", "schema": json_schema}
@@ -369,7 +387,7 @@ async def _complete_anthropic(
         ]
 
     request: dict[str, Any] = {
-        "model": ANTHROPIC_MODEL,
+        "model": model or ANTHROPIC_MODEL,
         "max_tokens": max_tokens,
         "system": system_value,
         "thinking": {"type": "adaptive"},
@@ -436,8 +454,12 @@ async def complete(
     json_schema: dict[str, Any] | None = None,
     cache_system: bool = False,
     on_progress: Callable[[LLMResult], None] | None = None,
+    model: str | None = None,
 ) -> LLMResult:
-    """Dispatch one model turn to the provider recorded in the Workflow input."""
+    """Dispatch one model turn to the provider recorded in the Workflow input.
+
+    `model` applies to Claude only; Gemini keeps GEMINI_MODEL.
+    """
     selected = normalize_provider(provider)
     if selected == "anthropic":
         return await _complete_anthropic(
@@ -449,6 +471,7 @@ async def complete(
             json_schema=json_schema,
             cache_system=cache_system,
             on_progress=on_progress,
+            model=model,
         )
 
     gemini_tools = list(tools) if tools else ([WEB_SEARCH_TOOL] if web_search else None)

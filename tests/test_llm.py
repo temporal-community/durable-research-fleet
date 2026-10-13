@@ -132,7 +132,7 @@ async def test_text_sources_and_search_count_are_extracted(fake):
     )
 
     out = await llm.complete(
-        system="s", prompt="p", tools=[llm.WEB_SEARCH_TOOL], effort="medium"
+        provider="gemini", system="s", prompt="p", tools=[llm.WEB_SEARCH_TOOL], effort="medium"
     )
 
     assert out.text == "grounded answer"
@@ -152,18 +152,18 @@ async def test_text_sources_and_search_count_are_extracted(fake):
 async def test_prompt_block_is_non_retryable(fake):
     fake(_resp(_candidate(text=None), block_reason="PROHIBITED_CONTENT"))
     with pytest.raises(llm.RefusalError, match="prompt:PROHIBITED_CONTENT"):
-        await llm.complete(system="s", prompt="p")
+        await llm.complete(provider="gemini", system="s", prompt="p")
 
 
 async def test_response_safety_finish_is_non_retryable(fake):
     fake(_resp(_candidate(text=None, finish_reason="SAFETY")))
     with pytest.raises(llm.RefusalError, match="response:SAFETY"):
-        await llm.complete(system="s", prompt="p")
+        await llm.complete(provider="gemini", system="s", prompt="p")
 
 
 async def test_max_tokens_returns_the_partial_response(fake):
     fake(_resp(_candidate("partial", finish_reason="MAX_TOKENS")))
-    out = await llm.complete(system="s", prompt="p")
+    out = await llm.complete(provider="gemini", system="s", prompt="p")
     assert out.text == "partial"
 
 
@@ -177,6 +177,7 @@ async def test_request_shape_for_structured_output(fake):
     }
 
     await llm.complete(
+        provider="gemini",
         system="system",
         prompt="prompt",
         json_schema=schema,
@@ -200,7 +201,7 @@ async def test_request_shape_for_structured_output(fake):
 
 async def test_google_search_is_passed_as_a_server_side_tool(fake):
     f = fake(_resp(_candidate()))
-    await llm.complete(system="s", prompt="p", tools=[llm.WEB_SEARCH_TOOL])
+    await llm.complete(provider="gemini", system="s", prompt="p", tools=[llm.WEB_SEARCH_TOOL])
     tools = f.calls[0]["config"].tools
     assert len(tools) == 1
     assert tools[0].google_search is not None
@@ -210,7 +211,7 @@ async def test_google_search_is_passed_as_a_server_side_tool(fake):
 async def test_invalid_thinking_level_fails_before_an_api_call(fake):
     f = fake(_resp(_candidate()))
     with pytest.raises(ValueError, match="unsupported Gemini thinking level"):
-        await llm.complete(system="s", prompt="p", effort="max")
+        await llm.complete(provider="gemini", system="s", prompt="p", effort="max")
     assert not f.calls
 
 
@@ -291,8 +292,45 @@ async def test_claude_pause_turn_loop_is_bounded(monkeypatch):
     assert out.rounds == llm.MAX_PAUSE_RESUMES + 1
 
 
-def test_provider_selection_is_explicit_and_defaults_to_gemini():
-    assert llm.normalize_provider(None) == "gemini"
+def test_provider_selection_is_explicit_and_defaults_to_claude():
+    assert llm.normalize_provider(None) == "anthropic"
     assert llm.normalize_provider(" ANTHROPIC ") == "anthropic"
     with pytest.raises(ValueError, match="unsupported research provider"):
         llm.normalize_provider("auto")
+
+
+def test_unnamed_provider_never_reaches_a_real_api_in_tests(monkeypatch):
+    """The default is Claude, so a test that forgets provider= would send a real request.
+    Keep that failing loudly here rather than as a 401 from the vendor in some other test.
+    """
+    monkeypatch.setattr(llm, "_anthropic_client", None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        llm.anthropic_client()
+
+
+def test_the_claude_search_tool_is_capped():
+    """Uncapped, a six-way fan-out ran 66 searches in 4m36s. The cap is the latency lever."""
+    assert llm.ANTHROPIC_WEB_SEARCH_TOOL["max_uses"] == llm.ANTHROPIC_MAX_SEARCHES >= 1
+    assert llm.ANTHROPIC_WEB_SEARCH_TOOL["type"] == "web_search_20260209"
+
+
+async def test_a_per_call_model_overrides_only_that_call(monkeypatch):
+    seen = {}
+
+    class _Msgs:
+        async def create(self, **kw):
+            seen.update(kw)
+            raise RuntimeError("stop after capturing the request")
+
+    class _Fake:
+        beta = type("B", (), {"messages": _Msgs()})()
+
+    monkeypatch.setattr(llm, "_anthropic_client", _Fake())
+    with pytest.raises(RuntimeError, match="stop after"):
+        await llm.complete(provider="anthropic", system="s", prompt="p", model="claude-x")
+    assert seen["model"] == "claude-x"
+    seen.clear()
+    with pytest.raises(RuntimeError, match="stop after"):
+        await llm.complete(provider="anthropic", system="s", prompt="p")
+    assert seen["model"] == llm.ANTHROPIC_MODEL

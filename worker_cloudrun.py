@@ -30,11 +30,8 @@ terraform/workerpool.tf, which is what actually sets these in the pool:
 import asyncio
 import logging
 
-from activities import say_hello
-from research_activities import RESEARCH_ACTIVITIES
-from research_workflow import ResearchWorkflow
+from apps import ACTIVITIES, WORKFLOWS
 from runtime import run_worker
-from workflows import HelloWorkflow
 
 logging.basicConfig(level=logging.INFO)
 
@@ -42,8 +39,8 @@ logging.basicConfig(level=logging.INFO)
 if __name__ == "__main__":
     asyncio.run(
         run_worker(
-            [HelloWorkflow, ResearchWorkflow],
-            [say_hello, *RESEARCH_ACTIVITIES],
+            WORKFLOWS,
+            ACTIVITIES,
             default_build_id="v1",
         )
     )

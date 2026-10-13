@@ -1,0 +1,4 @@
+# AgentCore Runtime packaging only. Not installed into the Cloud Run image; the
+# Runtime zip is built from requirements.txt + this file (agentcore/build.sh).
+# bedrock-agentcore brings boto3, which resolve_secrets uses.
+bedrock-agentcore>=1.9.1,<2

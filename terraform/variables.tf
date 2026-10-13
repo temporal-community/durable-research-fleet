@@ -36,8 +36,20 @@ variable "temporal_internal_ip" {
   default     = "10.10.0.10"
 }
 
+# On a rotating-egress VPN (Cloudflare WARP, corporate split-tunnel) the
+# auto-detected /32 goes stale without warning: the rule still looks correct in
+# the console, and SSH fails with a TIMEOUT rather than a refusal, which reads as
+# "the VM is down" instead of "your IP moved". Observed rotating twice in an hour
+# and across a /16, so widening to the VPN's range is sometimes the only way to
+# hold a tunnel open -- but that opens port 22 to every tenant sharing that
+# range, so widen deliberately, set it back to null afterwards, and never leave a
+# widened range in a committed tfvars.
+#
+# Check what the rule actually allows before debugging anything else:
+#   curl -s https://api.ipify.org
+#   gcloud compute firewall-rules describe <prefix>-allow-ssh --format='value(sourceRanges.list())'
 variable "ssh_source_ranges" {
-  description = "CIDRs allowed to SSH the Temporal VM. Leave null to auto-detect this machine's public IP; set [] to block SSH entirely."
+  description = "CIDRs allowed to SSH the Temporal VM. Leave null to auto-detect this machine's public IP; set [] to block SSH entirely. Auto-detect goes stale behind a rotating-egress VPN -- see the note above."
   type        = list(string)
   default     = null
 }
@@ -234,4 +246,22 @@ variable "anthropic_model" {
   description = "Claude model ID used when a Workflow selects Anthropic."
   type        = string
   default     = "claude-opus-5"
+}
+
+# Deleting a custom role does not free its id. GCP keeps the role recoverable for 7
+# days, purges it after 30, and RESERVES THE ID FOR 37 — so between day 7 and day 37 a
+# torn-down stack can neither undelete the old role nor create a new one with the same
+# id, and `make up` dies mid-apply on:
+#
+#   Error 400: You can't create a role_id (workerPoolScaler) which has been marked
+#   for deletion, failedPrecondition
+#
+# while `gcloud iam roles undelete` answers NOT_FOUND. Hit on 2026-09-06 redeploying a
+# stack torn down more than a week earlier. Bump this suffix to get a fresh id; the old
+# tombstone ages out on its own. Nothing reads the role by name — verify_stack.sh
+# deliberately checks the two verbs instead (scripts/verify_stack.sh §7).
+variable "scaler_role_suffix" {
+  description = "Suffix for the custom scaler role id; bump if the previous id is tombstoned"
+  type        = string
+  default     = ""
 }

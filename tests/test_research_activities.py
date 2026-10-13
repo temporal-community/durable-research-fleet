@@ -487,3 +487,22 @@ def test_liveness_is_decoupled_from_call_duration():
 
     assert ra.HEARTBEAT_INTERVAL_SECONDS < rw.RESEARCH_HEARTBEAT_TIMEOUT_SECONDS
     assert rw.RESEARCH_HEARTBEAT_TIMEOUT_SECONDS < llm.HTTP_TIMEOUT_SECONDS
+
+
+def test_the_research_prompt_states_a_search_budget_and_stays_constant():
+    """The prompt and the tool cap must agree: the prompt tells Claude to plan its searches,
+    the tool enforces the ceiling. Constant text keeps Claude's prompt cache valid.
+    """
+    import llm
+
+    assert "at most four searches" in ra.SYSTEM_RESEARCH
+    assert llm.ANTHROPIC_MAX_SEARCHES == 4, "update the prompt's number if the cap changes"
+    assert "{" not in ra.SYSTEM_RESEARCH
+
+
+def test_only_research_sub_questions_use_the_research_model():
+    import inspect
+
+    assert "model=RESEARCH_MODEL" in inspect.getsource(ra.research_subquestion)
+    for fn in (ra.plan_research, ra.synthesize):
+        assert "RESEARCH_MODEL" not in inspect.getsource(fn), fn.__name__

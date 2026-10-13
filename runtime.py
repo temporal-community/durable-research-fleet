@@ -18,12 +18,13 @@ import os
 import signal
 import socket
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 
 from temporalio.client import Client
 from temporalio.common import WorkerDeploymentVersion
-from temporalio.worker import Worker, WorkerDeploymentConfig
+from temporalio.worker import Interceptor, Worker, WorkerDeploymentConfig
 
 logger = logging.getLogger("serverless-worker")
 
@@ -122,7 +123,14 @@ async def connect(settings: Settings) -> Client:
     )
 
 
-def build_worker(client: Client, workflows: list, activities: list, settings: Settings) -> Worker:
+def build_worker(
+    client: Client,
+    workflows: list,
+    activities: list,
+    settings: Settings,
+    *,
+    interceptors: Sequence[Interceptor] = (),
+) -> Worker:
     """Construct the Worker.
 
     Split out from run_worker so tests can build the EXACT same Worker instead of
@@ -130,6 +138,9 @@ def build_worker(client: Client, workflows: list, activities: list, settings: Se
     test fixture that mirrored this by hand and omitted `use_worker_versioning`
     made every Workflow Task fail with "versioning behavior cannot be specified
     without deployment options being set with versioned mode".
+
+    `interceptors` is the one extension point: the AgentCore runtime uses it to watch
+    Activity traffic so it knows when a session may end. Nothing app-specific.
     """
     return Worker(
         client,
@@ -137,6 +148,7 @@ def build_worker(client: Client, workflows: list, activities: list, settings: Se
         workflows=workflows,
         activities=activities,
         max_concurrent_activities=settings.max_concurrent_activities,
+        interceptors=interceptors,
         # Without this the pool-level scale-in that Cloud Run performs (see
         # KNOWLEDGE_BASE.md §7.3 — it does not know which instance is busy)
         # kills in-flight Activities with no chance to finish or report.
