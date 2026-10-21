@@ -140,7 +140,7 @@ attempt and **the pool silently never scales — GCP reports nothing.** The only
 place it shows up is the Temporal server's own log:
 
 ```bash
-gcloud compute ssh research-fleet-temporal --zone us-central1-a \
+gcloud compute ssh research-fleet-temporal --zone us-east4-a \
   --command 'sudo journalctl -u temporal | grep UpdateWorkerSetSize'
 ```
 
@@ -151,10 +151,10 @@ Queues** until a Worker actually polls, and the WCI needs the Task Queue
 association to know what to watch. So after the first `make up`, run the pool once:
 
 ```bash
-gcloud run worker-pools update research-fleet-worker-pool --instances 1 --region us-central1
+gcloud run worker-pools update research-fleet-worker-pool --instances 1 --region us-east4
 # wait ~40s, confirm Task Queues now appear:
 #   temporal worker deployment describe-version --deployment-name research-fleet --build-id v1
-gcloud run worker-pools update research-fleet-worker-pool --instances 0 --region us-central1
+gcloud run worker-pools update research-fleet-worker-pool --instances 0 --region us-east4
 ```
 
 From then on the WCI handles it. Watch with `make status`.

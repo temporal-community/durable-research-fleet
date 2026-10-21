@@ -10,8 +10,8 @@
 set -uo pipefail
 
 PROJECT="${PROJECT:-serverless-workers-demo}"
-REGION="${REGION:-us-central1}"
-ZONE="${ZONE:-us-central1-a}"
+REGION="${REGION:-us-east4}"
+ZONE="${ZONE:-us-east4-a}"
 PREFIX="${PREFIX:-research-fleet}"
 BUILD_ID="${BUILD_ID:-v1}"
 TASK_QUEUE="${TASK_QUEUE:-research-queue}"

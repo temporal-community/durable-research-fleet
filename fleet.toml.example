@@ -6,8 +6,8 @@ worker = "local"          # local | cloudrun | agentcore  (`fleet use <worker>` 
 
 [cloudrun]
 project = "your-gcp-project"
-region = "us-central1"
-zone = "us-central1-a"
+region = "us-east4"
+zone = "us-east4-a"
 prefix = "research-fleet"   # also the Worker Deployment name
 build_id = "v1"
 frontend_port = 7233        # local end of `fleet tunnel`

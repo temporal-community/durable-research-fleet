@@ -411,6 +411,32 @@ is the *configured* instance count, which is what `verify_stack.sh` reads. Time 
 - **What helps the room: `./fleet warm`** (Cloud Run: raises the pool; AgentCore: starts a hello
   Workflow) a few minutes before the first question. AgentCore's cold start is ~17-20s.
 
+**Region moved to `us-east4` on 2026-10-21 (cold start is region dependent).** A Google reviewer
+(Sagar Randive) said the ~125s above is region dependent and suggested `us-east4`. The same stack
+in `us-east4`, measured with the Workflow history (start to first Workflow Task started) and the
+worker logs: 11.6s and 16.3s for hello Workflows (the second after 7 min idle at zero) and 22.8s
+for a real Gemini research question, against 88s, 124s and ~125s in `us-central1`. Small samples
+from one project, not a benchmark. Consequences worth knowing:
+- Cloud Run was asked for an instance 0.3s after the question and 0.2s after a Signal.
+- The pool stopped at **2** instances for 4 sub-questions (it reached 6 in `us-central1`), so
+  sub-questions 2-4 queued 12-28s behind the first two. "All started in the same second" is a
+  `us-central1` observation and does not hold in `us-east4`. The WCI overshoot seems to track the
+  slow first poll; that is a reading of the data, not a tested cause.
+- Scale-in: instances were gone 1m38s and 2m21s after the draft (about 6.5 min in `us-central1`).
+  After 5 min at zero, Good enough finished in 22.8s (1m39s before), and two instances started for
+  one task.
+- The `us-central1` stack was destroyed and rebuilt as `research-fleet` in `us-east4`. A deleted
+  GCP custom role id stays reserved for 37 days: `workerPoolScaler2` (old) and `workerPoolScalerEast4`
+  are taken, the live stack uses `SCALER_ROLE_SUFFIX=3`. A bucket re-created under a name deleted
+  minutes earlier can 404 on the first apply (GCS consistency); re-run `make apply`.
+- `make verify SCALE=1` on the rebuilt stack: 16 passed, 0 failed.
+- Leftover: the temporary test stack `rf-east4` (Terraform workspace `useast4`) is torn down except
+  `rf-east4-vpc` and its subnet, held by a Cloud Run `serverless-ipv4-*` reservation. They cost
+  nothing. Finish later with `terraform -chdir=terraform workspace select useast4`, then
+  `make down AUTO=1 PREFIX=rf-east4 REGION=us-east4 ZONE=us-east4-a SCALER_ROLE_SUFFIX=East4`, then
+  select `default` again. Always check `terraform workspace show` before any `make` command.
+  `builder-bot-vpc` is the older orphan from the July rename.
+
 **Chaos panel (added 2026-10-13, branch `feat/crash-visibility`).** `fleet run --chaos` sets
 `FLEET_CHAOS=1`, which turns on `POST /api/run/{id}/network` and the Chaos button. Rules:
 - **Only `fleet run --chaos` may set `FLEET_CHAOS`.** Not Terraform, not the Dockerfile; guarded by
@@ -501,7 +527,7 @@ Research app (full reasoning in `decisions/05-research-agent.md`):
   entangle game state with it.
 - **If asked to actually deploy it**: `make up` (Terraform owns everything).
   `docs/TUTORIAL.md` is the manual walkthrough behind it and assumes project
-  `serverless-workers-demo` / region `us-central1` — confirm before anything
+  `serverless-workers-demo` / region `us-east4` — confirm before anything
   destructive.
 - **If asked to add resilience/observability**: see docs/KNOWLEDGE_BASE.md §7.7
   for the OpenTelemetry Cloud Run pattern, and §7.3 for why

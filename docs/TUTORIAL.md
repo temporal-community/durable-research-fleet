@@ -86,7 +86,7 @@ purely about *where* the Worker runs.
 
 ```bash
 export PROJECT_ID=serverless-workers-demo
-export REGION=us-central1
+export REGION=us-east4
 
 gcloud config set project $PROJECT_ID
 
@@ -248,7 +248,7 @@ Use the CLI you built in Step 0 — released versions don't have these flags.
   --deployment-name research-fleet \
   --build-id v1 \
   --gcp-cloud-run-project serverless-workers-demo \
-  --gcp-cloud-run-region us-central1 \
+  --gcp-cloud-run-region us-east4 \
   --gcp-cloud-run-worker-pool research-worker-pool \
   --gcp-cloud-run-service-account <invoker-email-from-step-5>
 
@@ -283,10 +283,10 @@ instance actually starting from zero. Check it happened:
 
 ```bash
 gcloud run worker-pools describe research-worker-pool \
-  --region us-central1 --project serverless-workers-demo
+  --region us-east4 --project serverless-workers-demo
 
 gcloud run worker-pools logs read research-worker-pool \
-  --region us-central1 --project serverless-workers-demo
+  --region us-east4 --project serverless-workers-demo
 ```
 
 ### Burst mode — the actual "demo moment"
@@ -304,9 +304,9 @@ for a while.
 ## 8. Cleanup (avoid leaving billable resources on)
 
 ```bash
-gcloud run worker-pools delete research-worker-pool --region us-central1 --project serverless-workers-demo
+gcloud run worker-pools delete research-worker-pool --region us-east4 --project serverless-workers-demo
 gcloud secrets delete temporal-api-key --project serverless-workers-demo
-gcloud artifacts repositories delete research-fleet-repo --location us-central1 --project serverless-workers-demo
+gcloud artifacts repositories delete research-fleet-repo --location us-east4 --project serverless-workers-demo
 cd terraform && terraform destroy
 ```
 

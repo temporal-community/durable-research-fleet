@@ -24,8 +24,8 @@
 # certainly cannot deploy into it:
 #   make up AUTO=1 PROJECT=your-project-id
 PROJECT ?= serverless-workers-demo
-REGION  ?= us-central1
-ZONE    ?= us-central1-a
+REGION  ?= us-east4
+ZONE    ?= us-east4-a
 PREFIX  ?= research-fleet
 BUILD_ID ?= v1
 # Kept as its own variable rather than derived from PREFIX: the infra identifiers say
@@ -33,7 +33,7 @@ BUILD_ID ?= v1
 TASK_QUEUE ?= research-queue
 # Bump if a redeploy dies on "role_id (workerPoolScaler) ... marked for deletion":
 # GCP reserves a deleted custom role's id for 37 days (terraform/variables.tf).
-SCALER_ROLE_SUFFIX ?=
+SCALER_ROLE_SUFFIX ?= 3
 GEMINI_MODEL ?= gemini-3.6-flash
 ANTHROPIC_MODEL ?= claude-opus-5
 

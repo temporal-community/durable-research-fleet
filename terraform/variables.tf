@@ -6,12 +6,12 @@ variable "project_id" {
 
 variable "region" {
   type    = string
-  default = "us-central1"
+  default = "us-east4"
 }
 
 variable "zone" {
   type    = string
-  default = "us-central1-a"
+  default = "us-east4-a"
 }
 
 variable "name_prefix" {

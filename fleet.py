@@ -284,7 +284,7 @@ def cmd_warm(ctx: Ctx, args) -> int:
             ctx.say("a session starts in ~20s and stays up for the debounce window.")
         return rc
     sec = ctx.config.get("cloudrun", {})
-    project, region = sec.get("project"), sec.get("region", "us-central1")
+    project, region = sec.get("project"), sec.get("region", "us-east4")
     if not project:
         raise FleetError("set [cloudrun] project in fleet.toml")
     pool = f"{sec.get('prefix', 'research-fleet')}-worker-pool"
@@ -396,7 +396,7 @@ def _ship_agentcore(ctx: Ctx, args) -> int:
 
 def _ship_cloudrun(ctx: Ctx, args) -> int:
     sec = ctx.config.get("cloudrun", {})
-    project, region = sec.get("project"), sec.get("region", "us-central1")
+    project, region = sec.get("project"), sec.get("region", "us-east4")
     prefix, build = sec.get("prefix", "research-fleet"), args.build_id or sec.get("build_id", "v1")
     if not project:
         raise FleetError("set [cloudrun] project in fleet.toml")
