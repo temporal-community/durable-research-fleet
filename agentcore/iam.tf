@@ -76,19 +76,6 @@ data "aws_iam_policy_document" "runtime" {
       values   = ["bedrock-agentcore"]
     }
   }
-
-  statement {
-    sid = "WorkloadIdentity"
-    actions = [
-      "bedrock-agentcore:GetWorkloadAccessToken",
-      "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
-      "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
-    ]
-    resources = [
-      "arn:aws:bedrock-agentcore:${var.region}:${local.account_id}:workload-identity-directory/default",
-      "arn:aws:bedrock-agentcore:${var.region}:${local.account_id}:workload-identity-directory/default/workload-identity/${local.runtime_name}-*",
-    ]
-  }
 }
 
 resource "aws_iam_role_policy" "runtime" {

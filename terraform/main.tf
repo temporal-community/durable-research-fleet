@@ -40,7 +40,10 @@ locals {
     # no-sync (that is the Lambda setup); without rate-based, create-version
     # fails with "Could not instantiate scaling algorithm with type 'rate-based'".
     "workercontroller.scaling_algorithms.enabled" = jsonencode(["no-sync", "rate-based"])
-    # Hard ceiling on how far the WCI may scale the pool — the cost guard.
+    # Intended as a ceiling on how far the WCI scales the pool. NOTE (2026-11-03): Temporal's
+    # self-hosted docs describe this key as a limit on Worker Controller Instances per
+    # Namespace, and the per-pool cap is the compute-config flag --gcp-cloud-run-max-instances
+    # (default 30), which startup.sh.tftpl does not pass. Do not treat this as a spend cap.
     #
     # CAVEAT: this key name was recovered from the server binary's string table
     # (it is not in the published dynamic config reference). The server accepts

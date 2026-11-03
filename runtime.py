@@ -191,8 +191,8 @@ async def run_worker(workflows: list, activities: list, *, default_build_id: str
         settings.graceful_shutdown_seconds,
     )
 
-    # Exiting the context manager begins a graceful shutdown: stop polling,
-    # cancel in-flight Activities, wait up to graceful_shutdown_timeout.
+    # Exiting the context manager begins a graceful shutdown: stop polling, give in-flight
+    # Activities up to graceful_shutdown_timeout to finish, and only then cancel them.
     async with worker:
         await stop.wait()
 
