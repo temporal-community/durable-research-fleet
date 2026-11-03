@@ -22,18 +22,18 @@ One question becomes several independent research jobs (3–6, decided by the pl
 
 ## 🧭 Choose your platform
 
-Pick one per deployment. Everything above the compute layer is identical, and both platforms are **pre-release** on Temporal's side.
+Pick one per deployment. Everything above the compute layer is identical, and Temporal's Serverless Workers support is in **Public Preview** for Cloud Run and **Pre-release** for AgentCore.
 
 | | **Google Cloud Run** | **AWS AgentCore** |
 |---|---|---|
-| Where Temporal runs | Self-hosted on a GCP VM (unreleased CLI and server) | **Temporal Cloud**, AWS-hosted Namespace with the AgentCore pre-release enabled |
+| Where Temporal runs | Self-hosted on a GCP VM in this repo (Temporal Cloud with a GCP-hosted Namespace is the other documented route) | **Temporal Cloud**, AWS-hosted Namespace with the AgentCore pre-release enabled |
 | Compute unit | A Cloud Run Worker Pool instance that polls until it is scaled away | An AgentCore **session** (a microVM, up to 8 hours) that polls until idle, then drains |
 | How workers start | The Worker Controller sets the instance count | Temporal Cloud *invokes* a Runtime endpoint; Temporal decides how many sessions |
 | Activity slots per Worker | `1` | `3` |
 | Workers for a 5–6 way fan-out | Tracks the fan-out: one slot per instance | Fewer than sub-questions: 2–4 sessions seen |
 | Hosted web tier | Cloud Run Service, internal-only | None; the console runs locally with `make web-cloud` |
 
-**Pick Cloud Run** if you want the headline "one Worker per sub-question" picture on a projector and are comfortable self-hosting the pre-release Temporal server. **Pick AgentCore** if you already use Temporal Cloud on AWS and want no servers at rest; expect a smaller, less predictable worker count.
+**Pick Cloud Run** if you want the headline "one Worker per sub-question" picture on a projector and are comfortable self-hosting a Temporal server. **Pick AgentCore** if you already use Temporal Cloud on AWS and want no servers at rest; expect a smaller, less predictable worker count.
 
 ### 🎛 One CLI, either platform
 
@@ -48,7 +48,7 @@ cp fleet.toml.example fleet.toml          # per-developer config, gitignored, no
 ./fleet ask "How do heat pumps work?" -w agentcore -p gemini
 ./fleet status | verify | up | ship | down   # all take -w and --dry-run
 ./fleet run -w agentcore --chaos          # adds the Chaos panel: cut the network mid-run, watch retries, restore
-./fleet warm -w cloudrun                  # cold start is ~2 min; run this before the room arrives
+./fleet warm -w cloudrun                  # cold start: ~2 min in us-central1, 12-23s in us-east4; run this before the room arrives
 ./fleet use agentcore                     # make it the default
 ```
 
@@ -170,7 +170,7 @@ of its range.
 
 ## Deploy: Google Cloud Run
 
-> **Serverless Workers is Pre-release.** The Cloud Run provider is not in a released Temporal CLI/server. `make cli` builds the required main-branch CLI with the upstream Cloud Run field-mask fix pinned in, and Terraform ships it to the VM.
+> **Cloud Run support is in Public Preview** (AgentCore is Pre-release). `make cli` builds a main-branch CLI with the upstream Cloud Run field-mask fix pinned in, and Terraform ships it to the VM.
 
 ### What you need
 
@@ -187,7 +187,7 @@ make register-queues PROJECT=your-project-id
 make verify SCALE=1 PROJECT=your-project-id
 ```
 
-That sequence builds the unreleased Temporal CLI, creates the GCP stack, seeds Secret Manager without putting the keys in Terraform state, registers the Task Queues, and proves scale-from-zero.
+That sequence builds a main-branch Temporal CLI, creates the GCP stack, seeds Secret Manager without putting the keys in Terraform state, registers the Task Queues, and proves scale-from-zero.
 
 ### Open the console
 
@@ -204,7 +204,7 @@ Then open **http://localhost:8000**. Port overrides, SSH troubleshooting and red
 
 | Layer | GCP resource | Behavior |
 |---|---|---|
-| Temporal | Compute Engine VM | Private frontend at `10.10.0.10:7233`; runs the pre-release Worker Controller |
+| Temporal | Compute Engine VM | Private frontend at `10.10.0.10:7233`; runs the Worker Controller |
 | Research fleet | Cloud Run Worker Pool | Manual count controlled by Temporal; normally zero when idle |
 | Web tier | Cloud Run Service | Internal ingress and authenticated invocation only |
 | Model keys | Secret Manager | Both refs mount into Workers; values never pass through Terraform state |
@@ -216,7 +216,7 @@ Live check on August 18, 2026: 16/16 deployment checks passed. Five queued smoke
 
 ### Known limits
 
-The CLI and server it needs are unreleased, so a fresh checkout depends on `make cli`, and the web tier is reachable only through the tunnel by design. Details: [docs/CLOUDRUN.md](docs/CLOUDRUN.md).
+A fresh checkout builds its Temporal CLI with `make cli` (a main-branch build with a pinned fix; recent released CLIs also carry the Cloud Run flags, which this repo has not tested against), and the web tier is reachable only through the tunnel by design. Details: [docs/CLOUDRUN.md](docs/CLOUDRUN.md).
 
 ## Deploy: AWS AgentCore
 
@@ -228,7 +228,7 @@ The same Workflows and Activities run as Temporal Serverless Workers on **Amazon
 
 | Need | Notes |
 |---|---|
-| **Temporal Cloud Namespace, AWS-hosted** | With the **AgentCore Serverless Workers pre-release** enabled (ask your account team or open a support ticket). Self-hosted Temporal is not covered |
+| **Temporal Cloud Namespace, AWS-hosted** | With the **AgentCore Serverless Workers pre-release** enabled (ask your account team or open a support ticket). Temporal also documents a self-hosted route (server v1.32.0 or later); this repo is only tested on Temporal Cloud |
 | **A Temporal Cloud API key** | Ideally a service-account key scoped to this one Namespace |
 | **AWS account and credentials** | Permission for AgentCore, IAM, S3, Secrets Manager. Use a named profile: `AWS_PROFILE=...` |
 | **Region** | An AgentCore-supported Region, ideally next to your Namespace (default `ca-central-1`) |

@@ -18,7 +18,7 @@ resources, not container images or Go builds.
 | File | Resources |
 |---|---|
 | `main.tf` | provider, operator-IP detection, API enablement |
-| `network.tf` | VPC, subnet, static internal IP, two firewall rules |
+| `network.tf` | VPC, subnet, static internal IP, three firewall rules |
 | `iam.tf` | three service accounts and the impersonation chain |
 | `artifacts.tf` | Artifact Registry repo, bootstrap bucket, CLI object |
 | `vm.tf` | the Temporal VM + its bootstrap |
@@ -80,8 +80,8 @@ without one.
 |---|---|---|
 | `max_concurrent_activities` | `1` | Activity slots per instance. **Leave at 1 unless you know why you're raising it.** The SDK default is 100, which lets one instance swallow a whole burst so no Task Queue backlog forms and the WCI never scales — the demo silently does nothing. Also gives KB §4 slot isolation. |
 | `graceful_shutdown_seconds` | `20` | Drain window after SIGTERM. Keep below Cloud Run's termination grace period or the process is SIGKILLed mid-drain. |
-| `max_instances` | `10` | Cost guard, applied as `workercontroller.maxInstances`. Best-effort — see the caveat in `main.tf`. |
-| `worker_cpu` / `worker_memory` | `1` / `512Mi` | Sized for one Activity slot. Raise together with the slot count. |
+| `max_instances` | `30` | Cost guard, applied as `workercontroller.maxInstances`. Best-effort — see the caveat in `main.tf`. |
+| `worker_cpu` / `worker_memory` | `1` / `1Gi` | Sized for one Activity slot. Raise together with the slot count. |
 
 ### `no_sync_quiet_ms` is not settable here
 
@@ -195,8 +195,8 @@ on 2026-07-28 and the entire stack rebuilt by Terraform from an empty project
 Three layers, because each catches a different class of failure:
 
 ```bash
-make test      # 28 pytest + 7 terraform test assertions — offline, no cloud
-make verify    # 15 checks against the LIVE stack
+make test      # the pytest suite (212 tests) + terraform test assertions — offline, no cloud
+make verify    # 16 checks against the LIVE stack
 make verify SCALE=1   # adds the real scale-from-zero cycle (~4 min)
 ```
 

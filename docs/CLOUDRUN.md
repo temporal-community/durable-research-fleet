@@ -67,8 +67,9 @@ VPC remain, and they cost nothing. Re-run `make down` later to finish. Check wit
 
 ## Known limits
 
-- The CLI flags and the server this needs are unreleased (AGENTS.md "Deployment gates"), so a
-  fresh checkout depends on `make cli`, which builds a main-branch CLI.
+- A fresh checkout builds its Temporal CLI with `make cli` (a main-branch build, see AGENTS.md
+  "Deployment gates"). Recent released CLIs also carry the Cloud Run flags; this repo has not
+  tested against one.
 - The web tier is reachable only through the tunnel, by design.
 - Recreating the stack after a teardown can hit GCP's 37-day custom-role id reservation
   (`role_id (workerPoolScaler) ... marked for deletion`). Set `SCALER_ROLE_SUFFIX` to get a
