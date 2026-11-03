@@ -30,8 +30,10 @@ import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from temporalio.api.enums.v1 import TaskQueueType
@@ -69,6 +71,8 @@ PROVIDERS = frozenset({"gemini", "anthropic"})
 def _passcode_ok(supplied: str | None) -> bool:
     if not DEMO_PASSCODE:
         return True
+    if not isinstance(supplied, str):  # a JSON number or null must read as wrong, not crash
+        supplied = ""
     # compare_digest, not `==`. The timing signal on a short shared passcode over
     # HTTPS is not a practical attack, but this is a public repo people copy from and
     # `==` on a secret is the wrong thing to hand them.
@@ -195,6 +199,39 @@ def _rate_limited(ip: str) -> bool:
     return False
 
 
+# Wrong-passcode throttle. The passcode is a short shared word, so without this the check
+# itself is a guessing oracle: `_rate_limited` only counts accepted asks and never sees a
+# wrong code. After BAD_PASSCODES_PER_MINUTE wrong tries from one address, even the right
+# code is refused until the window clears.
+BAD_PASSCODES_PER_MINUTE = 10
+_bad_passcodes: dict[str, list[float]] = {}
+
+
+def _recent_bad_passcodes(ip: str) -> list[float]:
+    now = time.monotonic()
+    for stale in [k for k, v in _bad_passcodes.items() if not v or now - v[-1] > 60]:
+        del _bad_passcodes[stale]
+    return [t for t in _bad_passcodes.get(ip, []) if now - t < 60]
+
+
+def _passcode_locked_out(request: Request) -> bool:
+    return len(_recent_bad_passcodes(_client_ip(request))) >= BAD_PASSCODES_PER_MINUTE
+
+
+def _wrong_passcode(request: Request) -> HTTPException:
+    """The error for a refused passcode, recording the failure for the throttle."""
+    ip = _client_ip(request)
+    if _passcode_locked_out(request):
+        return HTTPException(status_code=429, detail="Too many wrong codes. Wait a minute.")
+    _bad_passcodes[ip] = _recent_bad_passcodes(ip) + [time.monotonic()]
+    return HTTPException(status_code=403, detail="Wrong passcode.")
+
+
+# Run ids this app creates are `research-<10 hex>`. Anything else is not one of ours, and
+# these routes would otherwise Query, describe or Signal ANY Workflow in the Namespace.
+RunId = Annotated[str, PathParam(pattern=r"^research-[0-9a-f]{10}$")]
+
+
 # --------------------------------------------------------------------------
 # API
 # --------------------------------------------------------------------------
@@ -206,8 +243,8 @@ async def ask(request: Request) -> dict:
     question = (body.get("question") or "").strip()
     provider = (body.get("provider") or DEFAULT_PROVIDER).strip().lower()
 
-    if not _passcode_ok(body.get("passcode")):
-        raise HTTPException(status_code=403, detail="Wrong passcode.")
+    if _passcode_locked_out(request) or not _passcode_ok(body.get("passcode")):
+        raise _wrong_passcode(request)
     if not question:
         raise HTTPException(status_code=400, detail="Ask something first.")
     if len(question) > MAX_QUESTION_CHARS:
@@ -237,7 +274,7 @@ async def ask(request: Request) -> dict:
 
 
 @app.get("/api/run/{workflow_id}")
-async def run_state(workflow_id: str) -> JSONResponse:
+async def run_state(workflow_id: RunId) -> JSONResponse:
     """The `progress` Query. The only run-state source the page reads.
 
     404 means "no such run" and NOTHING ELSE. A Query needs a Worker with a free
@@ -417,7 +454,7 @@ async def _activity_labels(client: Client, handle, workflow_id: str, wanted: set
 
 
 @app.get("/api/run/{workflow_id}/activities")
-async def run_activities(workflow_id: str) -> JSONResponse:
+async def run_activities(workflow_id: RunId) -> JSONResponse:
     """What Temporal itself says is in flight, with no Worker needed.
 
     404 means no such run; anything else transient is 503, same contract as `/api/run/{id}`.
@@ -452,7 +489,7 @@ async def run_activities(workflow_id: str) -> JSONResponse:
 
 
 @app.post("/api/run/{workflow_id}/network")
-async def cut_network(workflow_id: str, request: Request) -> dict:
+async def cut_network(workflow_id: RunId, request: Request) -> dict:
     """Chaos panel: cut or restore the model-API route for ONE run.
 
     It signals the Workflow, which flags its memo; each Activity attempt then fails while the
@@ -464,8 +501,8 @@ async def cut_network(workflow_id: str, request: Request) -> dict:
     if not CHAOS_ENABLED:
         raise HTTPException(status_code=404, detail="Not found.")
     body = await request.json()
-    if not _passcode_ok(body.get("passcode")):
-        raise HTTPException(status_code=403, detail="Wrong passcode.")
+    if _passcode_locked_out(request) or not _passcode_ok(body.get("passcode")):
+        raise _wrong_passcode(request)
     cut = body.get("cut")
     if not isinstance(cut, bool):
         raise HTTPException(status_code=400, detail="cut must be true or false")
@@ -486,7 +523,7 @@ async def cut_network(workflow_id: str, request: Request) -> dict:
 
 
 @app.post("/api/run/{workflow_id}/decision")
-async def decide(workflow_id: str, request: Request) -> dict:
+async def decide(workflow_id: RunId, request: Request) -> dict:
     """Send the review Signal — the event that wakes a pool sitting at zero.
 
     Guarded exactly like `/api/ask`, because it spends exactly like `/api/ask`: a
@@ -498,8 +535,8 @@ async def decide(workflow_id: str, request: Request) -> dict:
     body = await request.json()
     decision = (body.get("decision") or "").strip()
 
-    if not _passcode_ok(body.get("passcode")):
-        raise HTTPException(status_code=403, detail="Wrong passcode.")
+    if _passcode_locked_out(request) or not _passcode_ok(body.get("passcode")):
+        raise _wrong_passcode(request)
     if decision not in ("accept", "refine"):
         raise HTTPException(status_code=400, detail="decision must be accept or refine")
 

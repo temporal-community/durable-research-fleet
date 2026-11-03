@@ -21,7 +21,7 @@ class ResearchRequest:
     """Durable Workflow input. Provider selection is per run, never ambient."""
 
     question: str
-    provider: str = "gemini"
+    provider: str = "anthropic"  # keep equal to llm.DEFAULT_PROVIDER
 
 
 @dataclass

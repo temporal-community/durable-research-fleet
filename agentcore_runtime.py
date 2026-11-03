@@ -24,9 +24,10 @@ THE CONTRACT WITH THE SESSION
 WHAT THIS FILE DELIBERATELY DOES NOT DO
   - Import `bedrock_agentcore`. The HTTP app is injected as two callables, so this
     module and its tests need neither the SDK nor a network.
-  - Install signal handlers. The Worker lives inside the AgentCore app's event loop;
-    on termination that loop is cancelled and the `async with worker` exit performs
-    the graceful shutdown. Handlers here would fight the server's.
+  - Install signal handlers. The Worker lives inside the AgentCore app, on the app's own event
+    loop, and AgentCore documents no SIGTERM
+    behaviour, so a graceful drain on reclaim is NOT guaranteed (unverified; Temporal
+    retries a lost Activity). Handlers here would fight the server's.
   - Change the slot limit. `runtime.Settings` still defaults it to 1, so one question
     still fans out to one session per sub-question where the scaler allows it.
 """

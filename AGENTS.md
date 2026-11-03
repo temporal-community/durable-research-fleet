@@ -1,7 +1,7 @@
 # Research Fleet — Instructions for Coding Agents
 
-> **Dual-provider revision, 2026-08-17.** Gemini 3.6 Flash + Google Search is the
-> UI default for the Wednesday demo. The original Claude path remains available in
+> **Dual-provider revision, 2026-08-17.** (Gemini was the UI default then; since the
+> AgentCore merge the default is Claude, see "Provider choice" below.) Gemini 3.6 Flash + Google Search remains selectable. The original Claude path remains available in
 > the same deployment and retains `pause_turn`, `_resume_from`, ephemeral prompt
 > caching, and `MAX_PAUSE_RESUMES`. Provider selection is Workflow input from the UI,
 > not an environment switch, so it is durable and visible in Temporal history.
@@ -134,7 +134,7 @@ stack** — the names are baked into every resource — so don't do it casually;
 > **AgentCore target added 2026-10-05** (merged to `main` 2026-10-13, PR #4):
 > the same two apps can run as Temporal Serverless Workers on Amazon Bedrock AgentCore
 > Runtime against ONE Temporal Cloud Namespace. Read `docs/AGENTCORE.md`. It is
-> offline-tested (152 Python tests plus `make test-ac`) and **verified live on 2026-10-05**:
+> offline-tested (212 Python tests plus `make test-ac`) and **verified live on 2026-10-05**:
 > the hello smoke test, and the research app with both Claude and Gemini. `docs/AGENTCORE.md`
 > lists exactly what is and isn't proven. Worker counts differ from Cloud Run: Temporal
 > chose 2-4 sessions for 5-6 queued tasks, not one per task.
@@ -234,7 +234,7 @@ Don't reintroduce:
 A high-effort review on 2026-07-28 found 10 more, all fixed. The ones most worth
 not regressing:
 5. **`MAX_CONCURRENT_ACTIVITIES` must stay at 1 on Cloud Run** (AgentCore is deliberately 3; see
-   `docs/AGENTCORE.md`). The SDK default is 100, which
+   `docs/AGENTCORE.md`). Unset, the Python SDK allows 100 slots, which
    lets one instance absorb a whole burst so no Task Queue backlog forms and the
    WCI never scales — the demo silently does nothing. Verified: `--count 5` takes
    ~25s with the limit vs ~5s without. Also KB §4 slot isolation.
@@ -346,20 +346,25 @@ found locally or on a partial stack):
       briefly overcounts during scale-in. They bracket the truth from opposite sides.
 
 ## Deployment gates (as of 2026-07-28 — verify before assuming)
-1. **The CLI flags aren't released.** `--gcp-cloud-run-*` exist only on
-   `temporalio/cli` **main**; v1.7.1 and v1.8.1 have `--aws-lambda-*` only.
-   `make cli` builds a linux/amd64 binary from main; Terraform ships it to the VM
-   via GCS since there's no public release asset.
-2. **The SERVER must also be unreleased.** Released `temporalio/server:1.31.2`
+1. **CLI flags (history; updated 2026-11-03).** On 2026-07-28 `--gcp-cloud-run-*` existed only on
+   `temporalio/cli` **main**; v1.7.1 and v1.8.1 had `--aws-lambda-*` only. Released CLIs now carry
+   them (`temporal` 1.9.1 checked locally, including
+   `--gcp-cloud-run-scale-down-stabilization-duration`). `make cli` still builds a linux/amd64
+   binary from main with a pinned field-mask fix, and Terraform ships it to the VM via GCS;
+   whether a released CLI would do instead is untested.
+2. **Server version: observed 2026-07-28, retest before relying on it** (Temporal's docs now say
+   self-hosted Cloud Run needs v1.31.0 or later). On that date released `temporalio/server:1.31.2`
    contains the provider strings and accepts every `workercontroller.*` key —
    then fails at `create-version` with *"Could not instantiate scaling algorithm
    with type 'rate-based'"*. Only the server bundled with CLI main
    (1.32.0-158.0) succeeds. Don't trust binary strings or config acceptance as
    evidence the feature works; run `create-version`.
-3. **`rate-based` must be in `scaling_algorithms.enabled`, and the docs don't
-   say so.** The published self-hosted page lists only `no-sync` — that's the
-   Lambda config. Cloud Run needs both.
-4. **The Pre-release gate is Temporal Cloud-side only** — self-hosted needs no
+3. **`rate-based` must be in `scaling_algorithms.enabled`.** On 2026-07-28 the self-hosted page
+   listed only `no-sync` (the Lambda config). Temporal's Cloud Run page now lists `rate-based` and
+   says `no-sync` is rejected when paired with `gcp-cloud-run`. This stack enables both and was
+   verified live that way; `no-sync` is not known to be needed for Cloud Run.
+4. **The access gate is Temporal Cloud-side only** (Cloud Run is Public Preview, AgentCore is
+   Pre-release) — self-hosted needs no
    grant. Dynamic config uses repeated `--dynamic-config-value`;
    `--dynamic-config-file` does not exist.
 5. `worker deployment create` pre-defines a deployment so `create-version`
@@ -406,8 +411,9 @@ is the *configured* instance count, which is what `verify_stack.sh` reads. Time 
   and 12 for 5 hello Workflows. Expect overshoot on a cold start.
 - It scales in slowly, about one instance a minute (12 → 5 took ~11 minutes), so a second question
   within a few minutes starts instantly. That is why back-to-back runs looked fast.
-- The documented `--gcp-cloud-run-scale-down-stabilization-duration` flag is in NEITHER the pinned
-  main CLI nor `temporal` 1.9.1 here (`update-version-compute-config --help`), so it cannot be set yet.
+- `--gcp-cloud-run-scale-down-stabilization-duration` IS in `temporal` 1.9.1 (`create-version` and
+  `update-version-compute-config --help`, checked 2026-11-03). It was missing when this was measured
+  and has not been applied or measured on this stack.
 - **What helps the room: `./fleet warm`** (Cloud Run: raises the pool; AgentCore: starts a hello
   Workflow) a few minutes before the first question. AgentCore's cold start is ~17-20s.
 
@@ -478,8 +484,8 @@ would look like a broken app, not a network change.
   correct for Cloud Run — see docs/KNOWLEDGE_BASE.md §7.1. Don't "port" a
   Lambda-style exit-after-batch pattern in here.
 - **Every Workflow needs a versioning behavior** (`PINNED` or
-  `AUTO_UPGRADE`) — this is a hard Serverless Workers requirement, not
-  optional boilerplate.
+  `AUTO_UPGRADE`) — Temporal's Serverless Workers docs require one, set per Workflow
+  (as here) or as the Worker's `default_versioning_behavior`. Not optional boilerplate.
 - **The hello app is not a placeholder — it's the infrastructure smoke test.** It
   needs no model key, so `make verify SCALE=1` can diagnose a scaling problem
   without spending tokens. Don't delete it now the research app exists.
@@ -514,8 +520,9 @@ Research app (full reasoning in `decisions/05-research-agent.md`):
   code, so ship it under a new Build ID.
   Do not replace it with `RESEARCH_PROVIDER`; ambient configuration could switch a
   retry or replay to a different model than the one recorded when the run started.
-- **No time-skipping is possible in tests.** The test server rejects Worker
-  Versioning, which every Workflow here requires. Not a preference — a hard block.
+- **No time-skipping in tests.** In our testing the test server rejected Worker
+  Versioning, which every Workflow here requires (observed mid-2026; Temporal's docs do not
+  mention it, so retest on a newer CLI/SDK).
 - **Don't deploy a new `BUILD_ID` while a Workflow is awaiting review.** Parked
   executions are PINNED to the Version they started on.
 

@@ -10,7 +10,8 @@ repo, a docs-vs-demo consistency audit, and devrel/demo ideation. This is the
 consolidated "second brain" for the project — read this before the
 `TUTORIAL.md` if you want the *why*, not just the *how*.
 
-**Status at time of writing:** Serverless Workers are in **Pre-release**.
+**Status at time of writing:** As of 2026-11-03 Temporal's docs list AWS Lambda and GCP Cloud Run as **Public Preview** and
+Amazon Bedrock AgentCore as **Pre-release** (this document was written earlier, when all were Pre-release).
 Request access via a Temporal Cloud support ticket or your account team.
 APIs are experimental and may change in backwards-incompatible ways.
 GA support currently: Go, Python, TypeScript SDKs, on AWS Lambda (shipped)
@@ -580,7 +581,7 @@ this on Cloud Run rather than Lambda.
 - `docs.temporal.io/production-deployment/worker-deployments/serverless-workers/self-hosted-setup` — self-hosted Lambda prerequisites
 - `docs.temporal.io/develop/python/workers/serverless-workers/aws-lambda` — Python `lambda_worker` package reference
 - `docs.temporal.io/develop/go/workers/serverless-workers/aws-lambda` — Go SDK, OTel/X-Ray specifics
-- Preview branch (Cloud Run, pre-GA docs): deployment guide, Python SDK page, encyclopedia page, self-hosted setup — `.../serverless-workers/cloud-run` and `.../production-deployment/worker-deployments/serverless-workers/cloud-run`
+- Cloud Run (Public Preview): deployment guide, Python SDK page, encyclopedia page, self-hosted setup — `.../serverless-workers/cloud-run` and `.../production-deployment/worker-deployments/serverless-workers/cloud-run`
 - `temporal.io/blog/introducing-temporal-serverless-workers-deploy-temporal-workers-to-aws-lambda` — official launch blog
 - `byteiota.com` — two third-party articles covering the Lambda launch (useful for seeing how the feature gets described informally, less precise than the encyclopedia docs on trigger mechanics)
 - `github.com/lainecsmith/temporal-serverless-no-roads` — reference Lambda demo repo
@@ -593,7 +594,7 @@ this on Cloud Run rather than Lambda.
   "content coming soon" at time of writing — re-check when it's filled in,
   since it may formalize a qualified-image-digest-style equivalent to
   Lambda's versioned-ARN guidance.
-- Serverless Workers overall are Pre-release — expect breaking API changes;
+- AgentCore is Pre-release and Lambda/Cloud Run are Public Preview — expect API changes;
   re-verify flag names (`no_sync_quiet_ms`, dynamic config keys) against
   current docs before any public-facing demo.
 - Java and .NET SDK support, plus additional compute providers beyond

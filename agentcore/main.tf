@@ -67,7 +67,11 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "code" {
 
 # The key carries the content hash: identical code is the same object and therefore
 # the same Runtime configuration, so re-applying never publishes a spurious version.
+# depends_on: without it a first apply can upload before versioning is on, which pins the
+# Runtime to a "null" object version that a later build does not retain.
 resource "aws_s3_object" "code" {
+  depends_on = [aws_s3_bucket_versioning.code]
+
   bucket = aws_s3_bucket.code.id
   key    = "code/${filemd5("${path.module}/${var.code_zip}")}.zip"
   source = "${path.module}/${var.code_zip}"
@@ -77,6 +81,10 @@ resource "aws_s3_object" "code" {
 # --- Runtime ----------------------------------------------------------------------------
 
 resource "aws_bedrockagentcore_agent_runtime" "worker" {
+  # The Runtime references the role but not its policy; on a fresh account it could be
+  # created before the permissions it needs at session start exist.
+  depends_on = [aws_iam_role_policy.runtime]
+
   agent_runtime_name = local.runtime_name
   description        = "Temporal Serverless Worker for research-fleet (build ${var.build_id})"
   role_arn           = aws_iam_role.runtime.arn

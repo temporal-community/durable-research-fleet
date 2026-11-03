@@ -58,6 +58,10 @@ Could not instantiate scaling algorithm with type 'rate-based'
 
 Both are now enabled in `terraform/main.tf`'s `local.wci_dynamic_config`.
 
+Update 2026-11-03: Temporal's Cloud Run self-hosted page now lists `rate-based` itself and says
+`no-sync` is rejected when paired with `gcp-cloud-run`. The failure above was observed on
+2026-07-28 against `temporalio/server:1.31.2`; retest before citing it.
+
 ---
 
 ## Where we deviate deliberately

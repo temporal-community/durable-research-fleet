@@ -164,18 +164,18 @@ resource "google_cloud_run_v2_service" "web" {
   ]
 }
 
-# PUBLIC AND UNAUTHENTICATED, ON PURPOSE — the audience opens this on their phones
-# and cannot be asked to authenticate to GCP.
+# NOT PUBLIC (see the ingress and invoker settings below, and AGENTS.md gate #12). This was
+# once meant to be an open page for the audience's phones; it is internal-only now.
 #
-# It is also the sharpest edge in this stack: an unauthenticated POST starts a
-# Workflow that spends money on Gemini tokens. Four things bound the damage, and
-# all four should stay in place:
+# It is still the sharpest edge in this stack if anyone reaches it: a POST starts a
+# Workflow that spends money on model tokens. Four things are meant to bound the damage:
 #
 #   1. var.demo_passcode         a shared code announced from the stage
 #   2. ASKS_PER_MINUTE_PER_IP    per-IP rate limit in web.py
 #   3. MAX_QUESTION_CHARS        question length cap in web.py
-#   4. var.max_instances         the hard ceiling on Serverless Workers, which is
-#                                what actually bounds total spend
+#   4. var.max_instances         NOT a proven spend cap: Temporal documents the
+#                                workercontroller.maxInstances key as a limit on Worker
+#                                Controller Instances per Namespace, not per pool
 #
 # There is deliberately NO endpoint here that can scale the pool. Chaos-testing on
 # stage is a `gcloud run worker-pools update` from a terminal, so this public

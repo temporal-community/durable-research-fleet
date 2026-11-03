@@ -431,6 +431,9 @@ def test_the_page_leaves_attempt_counts_to_temporal_cloud():
 
 
 class _JsonRequest:
+    client = None  # `_client_ip` reads it; None means "unknown"
+    headers: dict = {}
+
     def __init__(self, body):
         self._body = body
 
@@ -533,3 +536,39 @@ def test_a_retry_is_not_silent_just_because_the_old_attempts_heartbeat_is_stale(
     timestamp, so it read as silent for a minute after the network came back."""
     row = _phase(_pa(attempt=4, state="STARTED", started_ago=4.0, beat_ago=300.0))
     assert row["phase"] == "running" and row["silent_for"] == 4.0
+
+
+# --- review hardening (2026-11-03) ------------------------------------------------------
+
+
+def test_run_routes_only_accept_ids_this_app_creates():
+    """These routes Query, describe and Signal. Without a pattern they reach ANY Workflow in
+    the Namespace, including ones that are not research runs."""
+    import re
+
+    for fn in (web.run_state, web.run_activities, web.cut_network, web.decide):
+        meta = inspect.signature(fn, eval_str=True).parameters["workflow_id"].annotation.__metadata__[0]
+        assert re.match(meta.metadata[0].pattern, "research-0123456789")
+        for bad in ("hello-0123456789", "research-ABC", "research-0123456789-x", "../x", ""):
+            assert not re.match(meta.metadata[0].pattern, bad), bad
+
+
+def test_a_non_string_passcode_is_wrong_not_a_crash(monkeypatch):
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "swordfish")
+    for supplied in (None, 123, ["swordfish"], {"a": 1}):
+        assert web._passcode_ok(supplied) is False
+
+
+async def test_wrong_passcodes_are_throttled_and_lock_out_the_right_one(monkeypatch):
+    monkeypatch.setattr(web, "DEMO_PASSCODE", "swordfish")
+    monkeypatch.setattr(web, "_bad_passcodes", {})
+    req = _JsonRequest({})
+    codes = []
+    for _ in range(web.BAD_PASSCODES_PER_MINUTE + 2):
+        assert web._passcode_locked_out(req) == (len(codes) >= web.BAD_PASSCODES_PER_MINUTE)
+        if web._passcode_locked_out(req) or not web._passcode_ok("nope"):
+            codes.append(web._wrong_passcode(req).status_code)
+    assert codes[: web.BAD_PASSCODES_PER_MINUTE] == [403] * web.BAD_PASSCODES_PER_MINUTE
+    assert set(codes[web.BAD_PASSCODES_PER_MINUTE :]) == {429}
+    # locked out: the RIGHT code is refused too, until the window clears
+    assert web._passcode_locked_out(req)

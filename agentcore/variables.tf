@@ -8,6 +8,13 @@ variable "prefix" {
   description = "Prefix for every resource name"
   type        = string
   default     = "research-fleet"
+
+  validation {
+    # The IAM role is Temporal-Cloud-Serverless-Worker-<prefix> (64 char limit), the ExternalId
+    # embeds it (5-45 chars), and the Runtime name must match [a-zA-Z][a-zA-Z0-9_]{0,47}.
+    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9-]{0,30}$", var.prefix))
+    error_message = "prefix must start with a letter, use only letters, digits and hyphens, and be at most 31 characters."
+  }
 }
 
 # --- Temporal Cloud: ONE Namespace ----------------------------------------------------
@@ -82,6 +89,11 @@ variable "idle_runtime_session_timeout" {
   description = "Seconds AgentCore keeps an idle session before reclaiming it"
   type        = number
   default     = 900
+
+  validation {
+    condition     = var.idle_runtime_session_timeout >= 60 && var.idle_runtime_session_timeout <= 28800
+    error_message = "idle_runtime_session_timeout must be between 60 and 28800 seconds."
+  }
 }
 
 variable "max_lifetime" {

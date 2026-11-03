@@ -4,9 +4,9 @@
 
 A second deployment target beside the GCP/Cloud Run stack. Same Workflows, same
 Activities, same `runtime.py`; only the compute provider and the Temporal topology
-change. **Pre-release** on Temporal's side: needs the AgentCore Serverless Workers grant
-on an **AWS-hosted Temporal Cloud Namespace** (not self-hosted; the self-hosted setup
-docs list only `aws-lambda`).
+change. **Pre-release** on Temporal's side: on Temporal Cloud it needs the AgentCore Serverless Workers
+grant on an **AWS-hosted Namespace**. Temporal also documents a self-hosted route (server v1.32.0
+or later); this repo has only been tested against Temporal Cloud.
 
 ## How it works
 
@@ -114,6 +114,9 @@ completed in **35s** (first at 18s, which is the cold start).
 - **Fan-out is real but is the scaler's call.** 5 queued tasks were served by **2** sessions
   (3 Activities on one, 2 on the other), not 5. Do not promise "one question, N workers" on
   stage for AgentCore the way the Cloud Run demo does; measure the width you actually get.
+  Measured 2026-11-03 on build 1.0.6: research questions used 2 to 7 sessions (4 to 6 for a
+  normal six-way question), and the same 5-Workflow hello check used 1 session, then 4, with
+  identical code and configuration. Warm sessions left over from an earlier run are reused.
 - A versioned Task Queue's `describe` returns `pollers: null`; poller counts must come from
   Workflow history (`verify.sh` does).
 
@@ -123,10 +126,35 @@ One question: 5 sub-questions, 14 grounded searches, 25 sources, 32,665 tokens, 
 `Pinned` to `research-fleet-agentcore:1.0.0`, parked correctly at the human-review pause.
 The 7 Activities ran on **3** distinct sessions (2 / 4 / 1). Two of them were both pid 340 on
 `localhost`, told apart only by the random suffix, so that suffix is load-bearing here.
-The Claude path has not been run on AgentCore yet (the Anthropic key was rotated).
+
+## Claude path, verified live 2026-11-03 (build 1.0.5, through `make web-cloud`)
+
+One question with `provider: anthropic`: 6 sub-questions, 24 web searches, 24 sources, 245,947
+tokens (164,704 cache reads), **0 failures**, `Pinned` to `research-fleet-agentcore:1.0.5`,
+parked at human review and completed after an `accept` Signal. About 1m40s from the question to
+the review pause, from a cold start with no Worker running. The 8 Activities (plan, 6 sub-questions,
+synthesize) ran on **5** distinct sessions. An earlier 6-way Claude run on 2026-10-16 is recorded
+in project notes but not here.
+
+## Chaos (cut the network), verified live 2026-11-03 (build 1.0.6, `fleet run -w agentcore --chaos`)
+
+The `network` Signal and the Activity-side outage check are in the Runtime zip, so no extra
+deployment is needed; only the console needs `--chaos`. Two runs, Claude, 6 sub-questions each:
+
+| Cut length | Restore to parts restarting | Review pause reached | Failed parts |
+|---|---|---|---|
+| 78 s | 47 s (the next retry sat in the 60 s backoff) | 227 s | 0 |
+| 24 s | 8 to 10 s | 146 s (about 100 s with no cut) | 0 |
+
+Both runs showed 6 interruptions and finished on their own after the restore. Cuts of about
+20 to 25 s resume quickly; the retry policy (2 s doubling, 60 s ceiling) makes longer cuts wait
+out the backoff. Checked through the API and Workflow history, not by watching the page.
 
 ## Still unverified
 
 - SIGTERM behaviour when AgentCore reclaims a session mid-Activity, so whether
-  `GRACEFUL_SHUTDOWN_SECONDS` is ever honoured.
-- The Claude provider path on AgentCore.
+  `GRACEFUL_SHUTDOWN_SECONDS` is ever honoured. AWS documents no SIGTERM handling and says only
+  that termination can take up to about 15 seconds. A read of `bedrock-agentcore` 1.24.1 shows it
+  runs the async entrypoint on a daemon-thread event loop, so the Worker's graceful shutdown
+  is unlikely to run on reclaim. Treat an Activity as lost when a session is reclaimed; Temporal
+  retries it. Do not promise a graceful drain.

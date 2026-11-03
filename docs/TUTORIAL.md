@@ -14,21 +14,23 @@ Temporal scales from zero. Burst some Workflows and watch it grow.
 
 ## 0. Before you start
 
-**Serverless Workers are in Pre-release, and the Cloud Run compute provider is
-not in a released CLI yet.** Two separate gates:
+**Cloud Run support is in Public Preview (AgentCore is Pre-release).** This tutorial was
+written when the Cloud Run flags existed only on the CLI's `main` branch. Two things to check:
 
-1. **CLI.** The `--gcp-cloud-run-*` flags used in Step 6 exist only on the `main`
-   branch of `temporalio/cli`. Released versions (v1.7.1, v1.8.1) have
-   `--aws-lambda-*` only. Build from source (needs Go):
+1. **CLI.** The `--gcp-cloud-run-*` flags used in Step 6 first appeared on the `main`
+   branch of `temporalio/cli`; v1.7.1 and v1.8.1 lacked them, and recent releases
+   (v1.9.1 checked) include them. Run
+   `temporal worker deployment create-version --help` first. If yours lacks them,
+   build from source (needs Go):
    ```bash
    git clone --depth 1 https://github.com/temporalio/cli.git
    cd cli && go build -o temporal-main ./cmd/temporal
    ./temporal-main worker deployment create-version --help   # verify the flags
    ```
    Alternatively, drive Steps 5–6 entirely through the Temporal Cloud UI.
-2. **Server.** Temporal *Cloud* needs Pre-release access granted on your
-   Namespace. A **self-hosted** server does not — the server bundled with the
-   CLI built above already supports the provider. See "Self-hosted alternative"
+2. **Server.** Temporal *Cloud* needs a GCP-hosted Namespace. A **self-hosted**
+   server needs v1.31.0 or later per Temporal's docs; the server bundled with the
+   CLI already supports the provider. See "Self-hosted alternative"
    at the bottom.
 
 For the Temporal Cloud route:
@@ -315,10 +317,10 @@ Temporal Cloud UI if you don't plan to reuse it.
 
 ---
 
-## Self-hosted alternative (no Pre-release access needed)
+## Self-hosted alternative
 
-The Pre-release gate is **Temporal Cloud-side only**. The server bundled with the
-CLI you built in Step 0 (1.32.0+) already supports the Cloud Run compute
+Self-hosting needs no Temporal Cloud access grant. The server bundled with the
+CLI (1.32.0+) already supports the Cloud Run compute
 provider, so you can do all of Steps 5–6 against your own server.
 
 Enable the Worker Controller via dynamic config. Note it's repeated
@@ -328,7 +330,7 @@ Enable the Worker Controller via dynamic config. Note it's repeated
 ./temporal-main server start-dev \
   --dynamic-config-value workercontroller.enabled=true \
   --dynamic-config-value 'workercontroller.compute_providers.enabled=["gcp-cloud-run"]' \
-  --dynamic-config-value 'workercontroller.scaling_algorithms.enabled=["no-sync"]'
+  --dynamic-config-value 'workercontroller.scaling_algorithms.enabled=["no-sync","rate-based"]'
 ```
 
 Give the server a GCP identity so it can impersonate the invoker SA:
