@@ -30,7 +30,7 @@ Pick one per deployment. Everything above the compute layer is identical, and Te
 | Compute unit | A Cloud Run Worker Pool instance that polls until it is scaled away | An AgentCore **session** (a microVM, up to 8 hours) that polls until idle, then drains |
 | How workers start | The Worker Controller sets the instance count | Temporal Cloud *invokes* a Runtime endpoint; Temporal decides how many sessions |
 | Activity slots per Worker | `1` | `3` |
-| Workers for a 5–6 way fan-out | Tracks the fan-out: one slot per instance | Fewer than sub-questions: 2–4 sessions seen |
+| Workers for a 5–6 way fan-out | Tracks the fan-out: one slot per instance | Fewer than sub-questions, and it varies: 2–7 sessions seen on research questions |
 | Hosted web tier | Cloud Run Service, internal-only | None; the console runs locally with `make web-cloud` |
 
 **Pick Cloud Run** if you want the headline "one Worker per sub-question" picture on a projector and are comfortable self-hosting a Temporal server. **Pick AgentCore** if you already use Temporal Cloud on AWS and want no servers at rest; expect a smaller, less predictable worker count.

@@ -83,7 +83,15 @@ echo "== 5. Fan-out (distinct Workers that ran an Activity, from history)"
 # macOS ships bash 3.2, which has no mapfile; word-splitting is safe for identities.
 WORKERS=($(workers_from_history "${ids[@]}"))
 n=${#WORKERS[@]}; for w in ${WORKERS[@]+"${WORKERS[@]}"}; do echo "  worker: $w"; done
-[ "$n" -gt 1 ] && ok "$n distinct Workers served $COUNT Workflows" || bad "only $n Worker served $COUNT Workflows (fan-out not happening; check slots and identities)"
+# Each session has several Activity slots (3 on AgentCore), so ONE session can correctly serve
+# all COUNT hello Activities, and how many sessions start is the scaler's call. That is a
+# warning, not a failure: the Workflows completing in step 4 is the real proof. If this stays
+# at 1 when COUNT is well above the slot count, check slots and Worker identities.
+if [ "$n" -gt 1 ]; then
+  ok "$n distinct Workers served $COUNT Workflows"
+else
+  echo "  WARN  only $n Worker served $COUNT Workflows (can be correct with several slots per session; the scaler decides)"
+fi
 echo "  (informational) peak pollers seen: $peak -- scaling is the scaler's call, not one session per task"
 
 echo "== 6. Scale-in (idle window is AGENTCORE_DEBOUNCE_SECONDS)"

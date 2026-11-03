@@ -114,6 +114,9 @@ completed in **35s** (first at 18s, which is the cold start).
 - **Fan-out is real but is the scaler's call.** 5 queued tasks were served by **2** sessions
   (3 Activities on one, 2 on the other), not 5. Do not promise "one question, N workers" on
   stage for AgentCore the way the Cloud Run demo does; measure the width you actually get.
+  Measured 2026-11-03 on build 1.0.6: research questions used 2 to 7 sessions (4 to 6 for a
+  normal six-way question), and the same 5-Workflow hello check used 1 session, then 4, with
+  identical code and configuration. Warm sessions left over from an earlier run are reused.
 - A versioned Task Queue's `describe` returns `pollers: null`; poller counts must come from
   Workflow history (`verify.sh` does).
 
@@ -132,6 +135,20 @@ parked at human review and completed after an `accept` Signal. About 1m40s from 
 the review pause, from a cold start with no Worker running. The 8 Activities (plan, 6 sub-questions,
 synthesize) ran on **5** distinct sessions. An earlier 6-way Claude run on 2026-10-16 is recorded
 in project notes but not here.
+
+## Chaos (cut the network), verified live 2026-11-03 (build 1.0.6, `fleet run -w agentcore --chaos`)
+
+The `network` Signal and the Activity-side outage check are in the Runtime zip, so no extra
+deployment is needed; only the console needs `--chaos`. Two runs, Claude, 6 sub-questions each:
+
+| Cut length | Restore to parts restarting | Review pause reached | Failed parts |
+|---|---|---|---|
+| 78 s | 47 s (the next retry sat in the 60 s backoff) | 227 s | 0 |
+| 24 s | 8 to 10 s | 146 s (about 100 s with no cut) | 0 |
+
+Both runs showed 6 interruptions and finished on their own after the restore. Cuts of about
+20 to 25 s resume quickly; the retry policy (2 s doubling, 60 s ceiling) makes longer cuts wait
+out the backoff. Checked through the API and Workflow history, not by watching the page.
 
 ## Still unverified
 
